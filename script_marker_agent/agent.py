@@ -2,66 +2,134 @@ import google.adk.agents as adk_agents
 import google.generativeai as genai
 import json
 
-class ContentAnalysisAgent(adk_agents.Agent):
+class MainMarkerAgent(adk_agents.Agent):
     """
-    An agent that analyzes refined student text against a rubric and provides per-criterion scores, justifications, and evidence highlights.
+    Outputs a clear, structured, human-readable breakdown for each criterion (not JSON, just well-structured text).
     """
-    def __init__(self, name: str = "ContentAnalysisAgent", model: str = "gemini-1.5-flash-latest"):
+    def __init__(self, name: str = "MainMarkerAgent", model: str = "gemini-1.5-flash-latest"):
         super().__init__(name=name)
         self._llm = genai.GenerativeModel(model)
 
-    def run(self, refined_text: str, rubric_markdown: str, question_text: str = None) -> dict:
-        """
-        Args:
-            refined_text: The student's response text (already OCR-refined).
-            rubric_markdown: The rubric as a Markdown table.
-            question_text: (Optional) The original question text, if available.
-        Returns:
-            A dict with keys: 'scores', 'justifications', 'evidence', 'total_score'.
-        """
+    def run(self, rubric_markdown: str, student_text: str) -> str:
         prompt = f"""
-You are an expert teacher and assessment assistant. Your job is to analyze a student's response against a rubric and provide detailed, criterion-based feedback.
+You are an expert teacher and assessment assistant. Analyze the student's work below against the rubric. For each criterion, provide a clear, concise, and structured breakdown in this format:
 
-**Instructions:**
-1. Parse the rubric table below. Identify each criterion and its maximum score.
-2. For each criterion, analyze the student's response and:
-   - Assign a score (0 to max for that criterion).
-   - Provide a short justification for the score.
-   - Highlight evidence from the student's response (quote or text span).
-3. Only analyze the student's response, not the question text.
-4. Return your output as a JSON object with this structure:
-{{
-  "scores": {{ "criterion1": score, ... }},
-  "justifications": {{ "criterion1": "...", ... }},
-  "evidence": {{ "criterion1": "quoted evidence", ... }},
-  "total_score": total
-}}
-5. Do not include any extra explanation or text outside the JSON object.
+Criterion: <criterion name>
+Suggested Mark: <mark> / <max mark> Marks
+Reasoning: <reasoning>
+Evidence + Justification: <evidence/quote/justification>
+
+Repeat for each criterion. Do not use JSON, code fences, or Markdown tables. Just output the breakdown for each criterion, one after another, in the format above. Always include the maximum mark for each criterion as shown, using the rubric table to determine the max mark.
 
 **Rubric Table (Markdown):**
 ---
 {rubric_markdown}
 ---
 
-**Student Response:**
+**Student Work (Text):**
 ---
-{refined_text}
+{student_text}
 ---
 """
-        if question_text:
-            prompt += f"\n(For reference, the original question was: {question_text})\n"
+        response = self._llm.generate_content(prompt)
+        return response.text.strip()
+
+class MarkExtractionAgent(adk_agents.Agent):
+    """
+    Extracts the suggested mark for a criterion from the main agent's output.
+    """
+    def __init__(self, name: str = "MarkExtractionAgent", model: str = "gemini-1.5-flash-latest"):
+        super().__init__(name=name)
+        self._llm = genai.GenerativeModel(model)
+
+    def run(self, main_output: str, criterion: str) -> str:
+        prompt = f"""
+Given the following breakdown for all criteria, extract ONLY the suggested mark for the criterion named '{criterion}'.
+
+Breakdown:
+---
+{main_output}
+---
+
+Return only the mark in the format 'X / Y Marks', where X is the awarded mark and Y is the maximum mark for this criterion. Do not return anything else.
+"""
+        response = self._llm.generate_content(prompt)
+        return response.text.strip()
+
+class ReasoningExtractionAgent(adk_agents.Agent):
+    """
+    Extracts the reasoning for a criterion from the main agent's output.
+    """
+    def __init__(self, name: str = "ReasoningExtractionAgent", model: str = "gemini-1.5-flash-latest"):
+        super().__init__(name=name)
+        self._llm = genai.GenerativeModel(model)
+
+    def run(self, main_output: str, criterion: str) -> str:
+        prompt = f"""
+Given the following breakdown for all criteria, extract ONLY the reasoning for the criterion named '{criterion}'.
+
+Breakdown:
+---
+{main_output}
+---
+
+Return only the reasoning, nothing else. Do NOT start your response with 'Reasoning:' or any label.
+"""
+        response = self._llm.generate_content(prompt)
+        return response.text.strip()
+
+class EvidenceExtractionAgent(adk_agents.Agent):
+    """
+    Extracts the evidence/justification for a criterion from the main agent's output.
+    """
+    def __init__(self, name: str = "EvidenceExtractionAgent", model: str = "gemini-1.5-flash-latest"):
+        super().__init__(name=name)
+        self._llm = genai.GenerativeModel(model)
+
+    def run(self, main_output: str, criterion: str) -> str:
+        prompt = f"""
+Given the following breakdown for all criteria, extract ONLY the evidence and justification for the criterion named '{criterion}'.
+
+Breakdown:
+---
+{main_output}
+---
+
+Return only the evidence and justification, nothing else. Do NOT start your response with 'Evidence + Justification:' or any label.
+"""
+        response = self._llm.generate_content(prompt)
+        return response.text.strip()
+
+class RubricCriterionExtractorAgent(adk_agents.Agent):
+    """
+    An agent that extracts a clean list of criterion names from a Markdown rubric table, ignoring separator lines and formatting artifacts.
+    """
+    def __init__(self, name: str = "RubricCriterionExtractorAgent", model: str = "gemini-1.5-flash-latest"):
+        super().__init__(name=name)
+        self._llm = genai.GenerativeModel(model)
+
+    def run(self, rubric_markdown: str) -> list:
+        prompt = f"""
+You are an expert at parsing Markdown tables. Given the following Markdown rubric table, extract a clean Python list of only the actual criterion names (ignore separator lines, formatting artifacts, asterisks, dashes, colons, etc.).
+
+Return only a valid Python list of strings, nothing else.
+
+**Rubric Table:**
+---
+{rubric_markdown}
+---
+"""
         try:
             response = self._llm.generate_content(prompt)
-            # Extract the JSON object from the response
             text = response.text.strip()
-            # Try to find the first and last curly braces to extract JSON
-            start = text.find('{')
-            end = text.rfind('}')
+            # Try to extract a Python list from the response
+            start = text.find('[')
+            end = text.rfind(']')
             if start != -1 and end != -1:
-                json_str = text[start:end+1]
-                return json.loads(json_str)
+                list_str = text[start:end+1]
+                return json.loads(list_str.replace("'", '"'))
             else:
-                raise ValueError("No JSON object found in LLM response.")
+                raise ValueError("No Python list found in LLM response.")
         except Exception as e:
-            print(f"An error occurred during content analysis: {e}")
-            return {"error": str(e), "raw_response": response.text if 'response' in locals() else None}
+            print(f"An error occurred during criterion extraction: {e}")
+            return []

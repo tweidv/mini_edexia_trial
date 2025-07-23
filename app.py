@@ -18,6 +18,10 @@ from script_marker_agent.rubric_formatting_agent import RubricFormattingAgent
 
 # Import the agents and the Phoenix setup function
 from script_marker_agent.ocr_refinement_agent import OcrRefinementAgent, setup_phoenix_tracing
+from script_marker_agent.agent import RubricCriterionExtractorAgent, MainMarkerAgent, MarkExtractionAgent, ReasoningExtractionAgent, EvidenceExtractionAgent
+import threading
+import time
+import shelve
 
 load_dotenv()
 genai.configure()
@@ -815,7 +819,7 @@ def index():
                                             <li style="margin-bottom: 0.5rem; display: flex; align-items: center; gap: 1rem;">
                                                 <span style="font-weight:500;">{{ work.student.name }}</span>
                                                 <span style="color:#888; font-size:0.95em;">({{ work.upload_time.strftime('%Y-%m-%d %H:%M') }})</span>
-                                                <a href="#" class="button" style="background:#eee;color:#333;padding:4px 10px;font-size:14px;">Review</a>
+                                                <a href="{{ url_for('review_work', submission_id=work.id) }}" class="button" style="background:#eee;color:#333;padding:4px 10px;font-size:14px;">Review</a>
                                                 <form method="post" action="{{ url_for('delete_work_submission', submission_id=work.id) }}" style="display:inline; margin:0;" onsubmit="return confirm('Delete this work submission?');">
                                                     <button type="submit" class="button delete-btn" style="padding:4px 10px;font-size:14px;margin-left:6px;background:#d9534f;">Delete</button>
                                                 </form>
@@ -1390,6 +1394,254 @@ def delete_work_submission(submission_id):
     db.session.commit()
     return redirect(url_for('index'))
 
+@app.route('/review_work/<int:submission_id>')
+def review_work(submission_id):
+    submission = WorkSubmission.query.get_or_404(submission_id)
+    task = submission.task
+    rubric = task.rubrics[0] if task.rubrics else None
+    criteria = []
+    analysis = None
+    status = 'Initializing...'
+    refined_text = None
+    filetype = submission.filetype or ''
+    file_url = None
+    text_content = None
+    if rubric:
+        extractor = RubricCriterionExtractorAgent()
+        criteria = extractor.run(rubric.content)
+    # Determine if we need to OCR or can use text directly
+    if submission.raw_text and submission.filetype == 'txt':
+        refined_text = submission.raw_text
+        status = 'Marking text...'
+        # Do not run the agent server-side; let the frontend always call /api/mark_work for consistency
+        analysis = None
+        status = 'Complete'
+    elif submission.filename:
+        # Need to OCR the file (image/pdf)
+        file_url = url_for('pure_ocr.serve_upload', filename=submission.filename)
+        status = 'Detecting text in image/pdf...'
+        # Call the Pure OCR API endpoint to get refined text
+        # (Assume /pureocr/api/job_status/<job_id> or similar is available)
+        # For now, just show status and a spinner, and use JS to poll for results
+    else:
+        status = 'No work uploaded.'
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Review Student Work</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; margin: 0; }
+            .review-layout { display: flex; height: 100vh; }
+            .review-left { flex: 2; overflow-y: auto; background: #fff; padding: 2rem; border-right: 1px solid #eee; }
+            .review-right { flex: 1; overflow-y: auto; background: #fafbfc; padding: 2rem; position: sticky; top: 0; height: 100vh; }
+            .rubric-criterion { background: #e0e0e0; border-radius: 8px; margin-bottom: 1.5rem; padding: 1.2rem 1.5rem; color: #333; box-shadow: 0 2px 6px rgba(0,0,0,0.04); transition: background 0.2s; }
+            .rubric-criterion .mark { font-weight: bold; font-size: 1.2em; }
+            .rubric-criterion .reasoning, .rubric-criterion .evidence { margin-top: 0.5em; font-size: 0.98em; }
+            .rubric-criterion .criterion-title { font-weight: bold; font-size: 1.1em; margin-bottom: 0.3em; }
+            .status-box { position: fixed; top: 2rem; right: 2rem; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 1rem 1.5rem; z-index: 1000; font-size: 1.1em; color: #333; display: flex; align-items: center; gap: 0.7em; }
+            .spinner { width: 22px; height: 22px; border: 3px solid #eee; border-top: 3px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        </style>
+    </head>
+    <body>
+        <div class="status-box" id="status-box">
+            <span id="status-text">{{ status }}</span>
+            <span id="status-spinner" class="spinner" {% if status == 'Complete' %}style="display:none;"{% endif %}></span>
+        </div>
+        <div class="review-layout">
+            <div class="review-left">
+                <a href="{{ url_for('index') }}" style="display:inline-block;margin-bottom:1em;color:#007bff;text-decoration:none;font-weight:500;font-size:1.05em;">&larr; Back</a>
+                <h2>{{ submission.task.name }}</h2>
+                <div style="color:#666;font-size:1.1em;margin-bottom:1.5em;">
+                    {{ submission.student.name }} - {{ submission.upload_time.strftime('%d-%m-%Y %H:%M') }}
+                </div>
+                {% if file_url %}
+                    {% if filetype in ['png', 'jpg', 'jpeg', 'gif'] %}
+                        <img src="{{ file_url }}" style="max-width:100%;border-radius:8px;" />
+                    {% elif filetype == 'pdf' %}
+                        <iframe src="{{ file_url }}" style="width:100%;height:80vh;border:none;"></iframe>
+                    {% else %}
+                        <a href="{{ file_url }}" target="_blank">Download file</a>
+                    {% endif %}
+                {% elif refined_text %}
+                    <pre style="background:#f7f7f7;padding:1.5rem;border-radius:8px;">{{ refined_text }}</pre>
+                {% else %}
+                    <p style="color:#888;">No work uploaded.</p>
+                {% endif %}
+            </div>
+            <div class="review-right" id="rubric-right">
+                <h2>Rubric</h2>
+                {% for criterion in criteria %}
+                    <div class="rubric-criterion" style="background: hsl({{ loop.index0 * 60 }}, 40%, 85%);">
+                        <div class="criterion-title">{{ criterion }}</div>
+                        <div class="mark">Suggested Mark: <b id="mark-{{ loop.index0 }}">{{ analysis[criterion]['suggested_mark'] if analysis and criterion in analysis and analysis[criterion].get('suggested_mark') != None else '—' }}</b></div>
+                        <div class="reasoning"><b>Reasoning:</b> <span id="reasoning-{{ loop.index0 }}" style="color:#444;">{{ analysis[criterion]['reasoning'] if analysis and criterion in analysis and analysis[criterion].get('reasoning') else '(not yet analyzed)' }}</span></div>
+                        <div class="evidence"><b>Evidence + Justification:</b> <span id="evidence-{{ loop.index0 }}" style="color:#444;">{{ analysis[criterion]['evidence_justification'] if analysis and criterion in analysis and analysis[criterion].get('evidence_justification') else '(not yet analyzed)' }}</span></div>
+                    </div>
+                {% else %}
+                    <p style="color:#888;">No rubric found.</p>
+                {% endfor %}
+            </div>
+        </div>
+        <script>
+        // Synchronous marking: single request, no polling
+        let statusText = document.getElementById('status-text');
+        let statusSpinner = document.getElementById('status-spinner');
+        let rubricRight = document.getElementById('rubric-right');
+        let submissionId = {{ submission.id }};
+        let criteria = {{ criteria|tojson }};
+        function updateRubricContainers(analysis) {
+            criteria.forEach(function(criterion, idx) {
+                let mark = analysis[criterion] && analysis[criterion]['suggested_mark'] !== undefined && analysis[criterion]['suggested_mark'] !== null ? analysis[criterion]['suggested_mark'] : '…';
+                let reasoning = analysis[criterion] && analysis[criterion]['reasoning'] ? analysis[criterion]['reasoning'] : '(not yet analyzed)';
+                let evidence = analysis[criterion] && analysis[criterion]['evidence_justification'] ? analysis[criterion]['evidence_justification'] : '(not yet analyzed)';
+                document.getElementById('mark-' + idx).textContent = mark;
+                document.getElementById('reasoning-' + idx).textContent = reasoning;
+                document.getElementById('evidence-' + idx).textContent = evidence;
+            });
+        }
+        function runMarkingOnce() {
+            statusText.textContent = 'Processing...';
+            fetch('/api/mark_work/' + submissionId)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'complete') {
+                        if (data.refined_text) {
+                            let left = document.querySelector('.review-left');
+                            if (!left.querySelector('pre')) {
+                                let pre = document.createElement('pre');
+                                pre.style.background = '#f7f7f7';
+                                pre.style.padding = '1.5rem';
+                                pre.style.borderRadius = '8px';
+                                pre.textContent = data.refined_text;
+                                left.appendChild(pre);
+                            }
+                        }
+                        if (data.analysis) {
+                            updateRubricContainers(data.analysis);
+                        }
+                        statusText.textContent = 'Complete';
+                        statusSpinner.style.display = 'none';
+                    } else if (data.status === 'error') {
+                        statusText.textContent = 'Error: ' + (data.error || 'Unknown error');
+                        statusSpinner.style.display = 'none';
+                        let rubricRight = document.getElementById('rubric-right');
+                        rubricRight.innerHTML = '<div style="color:#d9534f;font-weight:bold;">' + (data.error || 'Unknown error') + '</div>' + (data.raw_response ? '<pre style="margin-top:1em;max-width:100%;overflow-x:auto;">' + data.raw_response + '</pre>' : '');
+                    } else {
+                        statusText.textContent = data.status || 'Processing...';
+                    }
+                })
+                .catch((err) => {
+                    statusText.textContent = 'Error during marking.';
+                    statusSpinner.style.display = 'none';
+                    let rubricRight = document.getElementById('rubric-right');
+                    rubricRight.innerHTML = '<div style="color:#d9534f;font-weight:bold;">Error during marking.</div>';
+                });
+        }
+        // Run marking once on page load
+        runMarkingOnce();
+        </script>
+    </body>
+    </html>
+    """, file_url=file_url, filetype=filetype, refined_text=refined_text, criteria=criteria, analysis=analysis, status=status, submission=submission)
+
+@app.route('/api/mark_work/<int:submission_id>', methods=['GET'])
+def api_mark_work(submission_id):
+    submission = WorkSubmission.query.get_or_404(submission_id)
+    task = submission.task
+    rubric = task.rubrics[0] if task.rubrics else None
+    if not rubric:
+        return jsonify({'error': 'No rubric found for this task.'}), 400
+    # Step 1: Get text (OCR if needed)
+    refined_text = None
+    filetype = submission.filetype or ''
+    if submission.raw_text and submission.filetype == 'txt':
+        refined_text = submission.raw_text
+    elif submission.filename:
+        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, submission.filename))
+        ocr_result_path = os.path.join(app.config['UPLOAD_FOLDER'], f'{job_id}.txt')
+        if os.path.exists(ocr_result_path):
+            with open(ocr_result_path, 'r', encoding='utf-8') as f:
+                refined_text = f.read()
+        else:
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], submission.filename)
+            results, error = process_image_pipeline(file_path)
+            if error:
+                return jsonify({'status': 'error', 'error': error}), 500
+            refined_text = results['refined_text']
+            with open(ocr_result_path, 'w', encoding='utf-8') as f:
+                f.write(refined_text)
+    else:
+        return jsonify({'status': 'error', 'error': 'No work uploaded.'}), 400
+    # Extract criteria
+    extractor = RubricCriterionExtractorAgent()
+    criteria = extractor.run(rubric.content)
+    # Synchronous marking: run if not already done
+    key = get_marking_result_key(submission_id)
+    with shelve.open(MARKING_RESULTS_DB) as db:
+        if key in db and all(db[key][c]["status"] == "complete" for c in criteria):
+            result = db[key]
+        else:
+            # Run marking synchronously
+            result = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing"} for c in criteria}
+            db[key] = result
+            main_agent = MainMarkerAgent()
+            main_output = main_agent.run(rubric.content, refined_text)
+            for c in criteria:
+                mark_agent = MarkExtractionAgent()
+                reasoning_agent = ReasoningExtractionAgent()
+                evidence_agent = EvidenceExtractionAgent()
+                mark = mark_agent.run(main_output, c)
+                reasoning = reasoning_agent.run(main_output, c)
+                evidence = evidence_agent.run(main_output, c)
+                result[c] = {
+                    "suggested_mark": mark,
+                    "reasoning": reasoning,
+                    "evidence_justification": evidence,
+                    "status": "complete"
+                }
+            db[key] = result
+    return jsonify({'status': 'complete', 'refined_text': refined_text, 'analysis': result})
+
+# In-memory or persistent store for progressive marking results (for demo, use shelve)
+MARKING_RESULTS_DB = 'marking_results_db'
+
+def get_marking_result_key(submission_id):
+    return f"submission_{submission_id}"
+
+def run_progressive_marking(submission_id, rubric_content, student_text, criteria):
+    key = get_marking_result_key(submission_id)
+    with shelve.open(MARKING_RESULTS_DB) as db:
+        db[key] = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing"} for c in criteria}
+    # Run main marker agent
+    main_agent = MainMarkerAgent()
+    main_output = main_agent.run(rubric_content, student_text)
+    print(f"[DEBUG] Main marker output:\n{main_output}\n")
+    # For each criterion, run subagents and update the store
+    for c in criteria:
+        mark_agent = MarkExtractionAgent()
+        reasoning_agent = ReasoningExtractionAgent()
+        evidence_agent = EvidenceExtractionAgent()
+        mark = mark_agent.run(main_output, c)
+        print(f"[DEBUG] Mark for '{c}': {mark}")
+        with shelve.open(MARKING_RESULTS_DB) as db:
+            db[key][c]["suggested_mark"] = mark
+            db[key][c]["status"] = "mark_done"
+        time.sleep(0.5)  # Simulate progressive fill
+        reasoning = reasoning_agent.run(main_output, c)
+        print(f"[DEBUG] Reasoning for '{c}': {reasoning}")
+        with shelve.open(MARKING_RESULTS_DB) as db:
+            db[key][c]["reasoning"] = reasoning
+            db[key][c]["status"] = "reasoning_done"
+        time.sleep(0.5)
+        evidence = evidence_agent.run(main_output, c)
+        print(f"[DEBUG] Evidence for '{c}': {evidence}")
+        with shelve.open(MARKING_RESULTS_DB) as db:
+            db[key][c]["evidence_justification"] = evidence
+            db[key][c]["status"] = "complete"
+        time.sleep(0.5)
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
