@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template_string, redirect, url_for, jsonify, send_from_directory
+from flask import Flask, request, render_template_string, redirect, url_for, jsonify, send_from_directory, Blueprint
 from google.cloud import vision
 from PIL import Image, ImageDraw, ImageOps
 import io
@@ -11,6 +11,10 @@ import fitz  # PyMuPDF
 import google.generativeai as genai
 import uuid
 import multiprocessing
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import markdown
+from script_marker_agent.rubric_formatting_agent import RubricFormattingAgent
 
 # Import the agents and the Phoenix setup function
 from script_marker_agent.ocr_refinement_agent import OcrRefinementAgent, setup_phoenix_tracing
@@ -19,6 +23,24 @@ load_dotenv()
 genai.configure()
 
 app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+pure_ocr_bp = Blueprint('pure_ocr', __name__)
+
+class Task(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(128), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    rubrics = db.relationship('Rubric', backref='task', lazy=True)
+
+class Rubric(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.Text, nullable=False)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+
 
 # --- Job Management Setup ---
 # The manager and shared jobs dict will be created in the main block
@@ -48,37 +70,20 @@ def detect_document_text(image_path):
 
     return response.full_text_annotation
 
-def highlight_text_on_image_in_memory(image_path, text_annotation):
-    """Highlights detected text on an image with transparency and returns it from memory."""
-    # Open the base image and ensure it's in RGBA mode to handle transparency
-    base_img = Image.open(image_path).convert("RGBA")
-
-    # Create a transparent overlay to draw on
-    overlay = Image.new("RGBA", base_img.size, (255, 255, 255, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    # Set opacity to 20% (255 * 0.20 = 51)
-    # The RGBA fill is (Red, Green, Blue, Alpha)
-    highlight_fill = (255, 0, 0, 51)
-
+def extract_word_data_from_annotation(text_annotation):
+    """Extracts text and bounding box vertices for each word."""
+    word_data = []
     for page in text_annotation.pages:
         for block in page.blocks:
             for paragraph in block.paragraphs:
                 for word in paragraph.words:
-                    vertices = [(v.x, v.y) for v in word.bounding_box.vertices]
-                    draw.polygon(vertices, outline='red', fill=highlight_fill)
-
-    # Combine the overlay with the base image
-    combined_img = Image.alpha_composite(base_img, overlay)
-    
-    # Convert back to RGB for saving as JPEG (which doesn't support alpha)
-    final_img = combined_img.convert("RGB")
-
-    # Save the image to an in-memory buffer
-    buffer = io.BytesIO()
-    final_img.save(buffer, 'JPEG')
-    buffer.seek(0)
-    return buffer
+                    word_text = ''.join([symbol.text for symbol in word.symbols])
+                    vertices = [{'x': v.x, 'y': v.y} for v in word.bounding_box.vertices]
+                    word_data.append({
+                        "text": word_text,
+                        "vertices": vertices
+                    })
+    return word_data
 
 # HTML Template for the page
 HTML_TEMPLATE = """
@@ -199,7 +204,7 @@ HTML_TEMPLATE = """
                 const formData = new FormData();
                 formData.append('file', blob, 'capture.jpg');
                 
-                fetch('/', {
+                fetch('{{ url_for("pure_ocr.upload_and_process") }}', {
                     method: 'POST',
                     body: formData
                 })
@@ -249,29 +254,40 @@ def convert_pdf_to_images(pdf_path):
 def process_image_pipeline(image_path):
     """The main processing pipeline for an image."""
     
-    # 1. Run initial OCR
+    # 1. Get original image data before any processing
+    try:
+        with Image.open(image_path) as img:
+            original_dimensions = {"width": img.width, "height": img.height}
+        with open(image_path, "rb") as image_file:
+            raw_image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        return None, f"Could not read original image: {e}"
+
+    # 2. Run initial OCR
     full_annotation = detect_document_text(image_path)
     if not full_annotation or not full_annotation.text:
         return None, "Could not extract any text from the image."
 
     raw_text = full_annotation.text
 
-    # 2. Run the OcrRefinementAgent
+    # 3. Extract word coordinate data from the annotation
+    word_data = extract_word_data_from_annotation(full_annotation)
+
+    # 4. Run the OcrRefinementAgent
     refinement_agent = OcrRefinementAgent()
     refined_text = refinement_agent.run(
         raw_ocr_text=raw_text,
         original_image_path=image_path
     )
-
-    # 3. Highlight the image
-    image_buffer = highlight_text_on_image_in_memory(image_path, full_annotation)
-    img_base64 = base64.b64encode(image_buffer.getvalue()).decode('utf-8')
     
     results = {
         "refined_text": refined_text,
-        "img_base64": img_base64
+        "raw_image_base64": raw_image_base64,
+        "original_dimensions": original_dimensions,
+        "word_data": word_data
     }
     return results, None
+
 
 # --- Background Worker Function ---
 def run_processing_job(job_id, image_paths, jobs_dict):
@@ -341,7 +357,7 @@ def run_processing_job(job_id, image_paths, jobs_dict):
     print(f"WORKER (Job {job_id}): All pages processed. Job complete.")
 
 
-@app.route('/', methods=['GET', 'POST'])
+@pure_ocr_bp.route('/', methods=['GET', 'POST'])
 def upload_and_process():
     jobs = app.config['JOBS'] # Get the shared jobs dict from app config
     if request.method == 'POST':
@@ -386,7 +402,7 @@ def upload_and_process():
                     "status": "pending", 
                     "result": None, 
                     "error": None,
-                    "raw_image_path": url_for('serve_upload', filename=relative_path)
+                    "raw_image_path": url_for('pure_ocr.serve_upload', filename=relative_path)
                 }
 
             jobs[job_id] = {
@@ -404,14 +420,14 @@ def upload_and_process():
             process.start()
 
             # Redirect the user to the results page for this job
-            return redirect(url_for('show_results', job_id=job_id))
+            return redirect(url_for('pure_ocr.show_results', job_id=job_id))
 
         else:
             return render_template_string(HTML_TEMPLATE, error="File type not allowed.")
 
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/results/<job_id>')
+@pure_ocr_bp.route('/results/<job_id>')
 def show_results(job_id):
     """
     This is the page the user sees while the job is processing.
@@ -436,21 +452,38 @@ def show_results(job_id):
             .paginator { display: flex; justify-content: center; align-items: center; gap: 1rem; margin-bottom: 2rem; }
             .paginator button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
             #page-indicator { font-size: 18px; font-weight: bold; }
-            .results-container { display: flex; max-width: 1200px; margin: 0 auto; gap: 30px; }
+            .results-container { display: flex; max-width: 90vw; margin: 2rem auto; gap: 30px; }
             .container { flex: 1; padding: 20px; background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            #image-container { flex: 2; }
             h2 { color: #1c1e21; border-bottom: 1px solid #eee; padding-bottom: 10px; }
             img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; }
             pre { white-space: pre-wrap; word-wrap: break-word; background-color: #f7f7f7; padding: 15px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; line-height: 1.6; }
             .loading-placeholder { display: flex; justify-content: center; align-items: center; height: 300px; color: #888; font-size: 20px; }
             .spinner { margin: 20px auto; border: 5px solid rgba(0, 0, 0, 0.1); width: 40px; height: 40px; border-radius: 50%; border-left-color: #007bff; animation: spin 1s ease infinite; }
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .highlight {
+                position: absolute;
+                border: 1px solid;
+                cursor: pointer;
+                transition: background-color 0.2s, border-color 0.2s;
+            }
+            .highlight:hover {
+                background-color: rgba(100, 100, 255, 0.4);
+                border-color: blue;
+            }
+            /* New styles for search-based highlighting */
+            .highlight.green { background-color: rgba(0, 255, 0, 0.3); border-color: green; }
+            .highlight.yellow { background-color: rgba(255, 255, 0, 0.4); border-color: #cca300; }
+
+            .search-section { text-align: center; margin-bottom: 2rem; }
+            .search-section input { padding: 10px; font-size: 16px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
         </style>
     </head>
     <body>
         <div class="header">
             <h1>Document Results</h1>
             <p>Job ID: {{ job_id }}</p>
-            <p><a href="/">Process another document</a></p>
+            <p><a href="{{ url_for('pure_ocr.upload_and_process') }}">Process another document</a></p>
         </div>
 
         <div class="paginator">
@@ -459,9 +492,13 @@ def show_results(job_id):
             <button id="next-page">Next &raquo;</button>
         </div>
 
+        <div class="search-section">
+            <input type="text" id="search-bar" placeholder="Type to highlight words...">
+        </div>
+
         <div class="results-container">
             <div class="container" id="image-container">
-                <h2>Highlighted Image</h2>
+                <h2>Script Image</h2>
                 <div class="loading-placeholder"><div class="spinner"></div></div>
             </div>
             <div class="container" id="text-container">
@@ -474,7 +511,8 @@ def show_results(job_id):
             const JOB_ID = "{{ job_id }}";
             const TOTAL_PAGES = parseInt("{{ total_pages }}", 10);
             let currentPage = 1;
-            let pollingTimerId = null; // Keep track of the current polling timer
+            let pollingTimerId = null;
+            let currentWordData = []; // Store the word data for the current page
 
             const prevButton = document.getElementById('prev-page');
             const nextButton = document.getElementById('next-page');
@@ -494,7 +532,51 @@ def show_results(job_id):
                 // This silently fetches the data for a page and warms up the browser cache.
                 // We don't need to do anything with the response.
                 console.log(`Prefetching data for page ${pageNumber}`);
-                fetch(`/api/job_status/${JOB_ID}`);
+                fetch(`/pureocr/api/job_status/${JOB_ID}`);
+            }
+            
+            function updateHighlights() {
+                const searchTerm = document.getElementById('search-bar').value;
+                const imageWrapper = document.getElementById('image-content-wrapper');
+
+                if (!imageWrapper || !currentWordData) return;
+
+                // Remove existing highlights before redrawing
+                imageWrapper.querySelectorAll('.highlight').forEach(h => h.remove());
+
+                // If the search term is empty, do not draw any highlights
+                if (!searchTerm) {
+                    return;
+                }
+
+                let highlightsHTML = '';
+                const originalWidth = imageWrapper.dataset.originalWidth;
+                const originalHeight = imageWrapper.dataset.originalHeight;
+
+                currentWordData.forEach((word, index) => {
+                    let className = 'highlight';
+                    let shouldHighlight = false;
+                    
+                    if (word.text.includes(searchTerm)) {
+                        className += ' green';
+                        shouldHighlight = true;
+                    } else if (word.text.toLowerCase().includes(searchTerm.toLowerCase())) {
+                        className += ' yellow';
+                        shouldHighlight = true;
+                    }
+
+                    if (shouldHighlight) {
+                        const vertices = word.vertices;
+                        const x = vertices[0].x / originalWidth * 100;
+                        const y = vertices[0].y / originalHeight * 100;
+                        const width = (vertices[1].x - vertices[0].x) / originalWidth * 100;
+                        const height = (vertices[2].y - vertices[1].y) / originalHeight * 100;
+
+                        highlightsHTML += `<div class="${className}" data-word-index="${index}" style="left: ${x}%; top: ${y}%; width: ${width}%; height: ${height}%;"></div>`;
+                    }
+                });
+                
+                imageWrapper.insertAdjacentHTML('beforeend', highlightsHTML);
             }
             
             function fetchAndRenderPage(pageNumber) {
@@ -506,52 +588,52 @@ def show_results(job_id):
 
                 pageIndicator.textContent = `Page ${pageNumber} / ${TOTAL_PAGES}`;
                 
-                // Set initial loading state ONLY if the content isn't already there from a previous load
-                if (!document.getElementById('image-content-wrapper')) {
-                    imageContainer.innerHTML = `<h2>Highlighted Image</h2><div id="image-content-wrapper"><div class="loading-placeholder"><div class="spinner"></div></div></div>`;
-                    textContainer.innerHTML = `<h2>Refined Text</h2><div class="loading-placeholder" id="text-content">Processing page...</div>`;
-                }
+                // Set initial loading state
+                document.getElementById('image-container').innerHTML = `<h2>Script Image</h2><div id="image-content-wrapper"><div class="loading-placeholder"><div class="spinner"></div></div></div>`;
+                document.getElementById('text-container').innerHTML = `<h2>Refined Text</h2><div class="loading-placeholder" id="text-content">Processing page...</div>`;
 
-                fetch(`/api/job_status/${JOB_ID}`)
+                fetch(`/pureocr/api/job_status/${JOB_ID}`)
                     .then(response => response.json())
                     .then(data => {
                         const pageData = data.pages[pageNumber];
 
                         if (pageData.status === 'completed') {
                             const result = pageData.result;
-                            document.getElementById('image-container').innerHTML = `<h2>Highlighted Image</h2><img src="data:image/jpeg;base64,${result.img_base64}" alt="Highlighted OCR Image" />`;
+                            currentWordData = result.word_data; // Store the word data globally for this page
+                            
+                            const imageHTML = `
+                                <h2>Script Image</h2>
+                                <div id="image-content-wrapper" style="position: relative; line-height: 0;" data-original-width="${result.original_dimensions.width}" data-original-height="${result.original_dimensions.height}">
+                                    <img src="data:image/jpeg;base64,${result.raw_image_base64}" alt="Original Script Image" style="width: 100%;" />
+                                </div>`;
+                            
+                            document.getElementById('image-container').innerHTML = imageHTML;
                             document.getElementById('text-container').innerHTML = `<h2>Refined Text</h2><pre>${result.refined_text}</pre>`;
+
+                            updateHighlights(); // Check if there's any text in the search bar on load
 
                             // Smart Pre-fetching
                             prefetchPage(pageNumber - 1);
                             prefetchPage(pageNumber + 1);
                         } else if (pageData.status === 'failed') {
-                            document.getElementById('image-container').innerHTML = '<h2>Highlighted Image</h2><div class="loading-placeholder">Failed to process.</div>';
+                            document.getElementById('image-container').innerHTML = '<h2>Script Image</h2><div class="loading-placeholder">Failed to process.</div>';
                             document.getElementById('text-container').innerHTML = `<h2>Refined Text</h2><div class="loading-placeholder">Error: ${pageData.error}</div>`;
                         } else {
-                            // --- START OF FIX ---
-                            // We are still loading. Only update the part of the DOM that needs to change.
-                            const textContent = document.getElementById('text-content');
-                            const imageContentWrapper = document.getElementById('image-content-wrapper');
-
-                            // If the image placeholder isn't there yet, create it.
-                            if (!imageContentWrapper || imageContentWrapper.className !== 'loading') {
-                                document.getElementById('image-container').innerHTML = `<h2>Highlighted Image</h2>
-                                    <div id="image-content-wrapper" class="loading" style="position: relative;">
-                                        <img src="${pageData.raw_image_path}" alt="Page ${pageNumber} is processing">
-                                        <div class="image-overlay">
-                                            <div class="spinner"></div>
-                                            Processing...
-                                        </div>
-                                    </div>`;
-                            }
+                            // Still loading, show the raw image (no highlights)
+                            document.getElementById('image-container').innerHTML = `<h2>Script Image</h2>
+                                <div id="image-content-wrapper" class="loading" style="position: relative;">
+                                    <img src="${pageData.raw_image_path}" alt="Page ${pageNumber} is processing" style="width: 100%;">
+                                    <div class="image-overlay">
+                                        <div class="spinner"></div>
+                                        Processing...
+                                    </div>
+                                </div>`;
                             
-                            // Only update the text content. This prevents the whole page from re-rendering.
                             const currentlyProcessing = data.currently_processing_page || '...';
+                            const textContent = document.getElementById('text-content');
                             if (textContent) {
                                 textContent.textContent = `Processing page ${currentlyProcessing}...`;
                             }
-                            // --- END OF FIX ---
                             
                             // Schedule a new check
                             pollingTimerId = setTimeout(() => fetchAndRenderPage(pageNumber), 2000);
@@ -559,7 +641,7 @@ def show_results(job_id):
                     })
                     .catch(error => {
                         console.error('Error fetching page data:', error);
-                        imageContainer.innerHTML = '<h2>Highlighted Image</h2><div class="loading-placeholder">Error fetching data.</div>';
+                        imageContainer.innerHTML = '<h2>Script Image</h2><div class="loading-placeholder">Error fetching data.</div>';
                         textContainer.innerHTML = '<h2>Refined Text</h2><div class="loading-placeholder">Please refresh.</div>';
                     });
             }
@@ -586,6 +668,9 @@ def show_results(job_id):
                 }
             });
 
+            // Add event listener for the search bar
+            document.getElementById('search-bar').addEventListener('input', updateHighlights);
+
             // Initial setup
             updateNavButtons();
             fetchAndRenderPage(currentPage); // Fetch the first page on load
@@ -595,7 +680,7 @@ def show_results(job_id):
     """, job_id=job_id, total_pages=total_pages)
 
 
-@app.route('/api/job_status/<job_id>')
+@pure_ocr_bp.route('/api/job_status/<job_id>')
 def job_status(job_id):
     """Provides the current status of a job as JSON."""
     jobs = app.config['JOBS']
@@ -629,10 +714,385 @@ def job_status(job_id):
         
     return jsonify(job_data)
 
-@app.route('/uploads/<path:filename>')
+@pure_ocr_bp.route('/uploads/<path:filename>')
 def serve_upload(filename):
     """Serves files from the uploads directory."""
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.template_filter('markdown')
+def markdown_filter(s):
+    return markdown.markdown(s, extensions=['tables'])
+
+@app.route('/')
+def index():
+    """Shows the main task dashboard."""
+    # Pagination for tasks: show 5 per page, newest first
+    page = int(request.args.get('page', 1))
+    per_page = 5
+    tasks_query = Task.query.order_by(Task.created_at.desc())
+    tasks_paginated = tasks_query.paginate(page=page, per_page=per_page, error_out=False)
+    tasks = tasks_paginated.items
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Mini Edexia Dashboard</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f2f5; margin: 40px; }
+            .container { max-width: 90vw; width: 90vw; margin: auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            h1, h2 { color: #1c1e21; }
+            a { color: #007bff; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            .task-list { list-style: none; padding: 0; }
+            .task-item { border: 1px solid #ddd; border-radius: 4px; margin-bottom: 1rem; }
+            .task-header { background: #f7f7f7; padding: 1rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+            .rubric-content { padding: 1rem; border-top: 1px solid #ddd; display: none; }
+            .rubric-content table { width: 100%; border-collapse: collapse; }
+            .rubric-content th, .rubric-content td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+            .form-section { margin-top: 2rem; border-top: 1px solid #eee; padding-top: 2rem; }
+            .tabs { display: flex; border-bottom: 1px solid #ccc; margin-bottom: 1rem; }
+            .tab-link { padding: 10px 15px; cursor: pointer; border: 1px solid transparent; border-bottom: none; }
+            .tab-link.active { border-color: #ccc; border-bottom-color: white; background: white; }
+            .tab-content { display: none; }
+            .tab-content.active { display: block; }
+            .form-group { margin-bottom: 1rem; }
+            .form-group label { display: block; margin-bottom: .5rem; font-weight: bold; }
+            .form-group input, .form-group textarea, .form-group input[type="file"] { width: 100%; padding: .5rem; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
+            .form-group textarea { min-height: 150px; font-family: monospace; }
+            .button { padding: 12px 20px; background-color: #007bff; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
+            .edit-btn { background: #f0ad4e; margin-right: 10px; }
+            .delete-btn { background: #d9534f; }
+            .edit-rubric-btn { background: #f0ad4e; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Mini Edexia Dashboard</h1>
+            <p><a href="{{ url_for('pure_ocr.upload_and_process') }}">Go to Pure OCR Tool &raquo;</a></p>
+            <h2>Existing Tasks</h2>
+            {% if tasks %}
+                <div class="task-list">
+                    {% for task in tasks %}
+                        <div class="task-item">
+                            <div class="task-header">
+                                <span>{{ task.name }}</span>
+                                <div>
+                                    <span style="color: #888; font-size: 0.95em;">Created: {{ task.created_at.strftime('%Y-%m-%d %H:%M') if task.created_at else 'N/A' }}</span>
+                                </div>
+                            </div>
+                            <div class="rubric-content" id="rubric-content-{{ task.id }}" style="display:none;">
+                                <div id="rubric-markdown-{{ task.id }}" style="display:block;">
+                                    {% if task.rubrics %}
+                                        {{ task.rubrics[0].content | markdown | safe }}
+                                    {% endif %}
+                                </div>
+                                <div style="margin-top: 16px; display: flex; flex-direction: row; gap: 10px; align-items: center;">
+                                    <button type="button" class="button edit-rubric-btn" style="margin:0;" onclick="showEditForm({{ task.id }})" id="edit-task-btn-{{ task.id }}">Edit Task</button>
+                                    <button type="button" class="button" style="background:#aaa;color:#fff;margin:0 0 0 10px;" onclick="showRawEditForm({{ task.id }})" id="raw-edit-btn-{{ task.id }}">Force Edit (Raw)</button>
+                                    <form method="post" action="{{ url_for('delete_task', task_id=task.id) }}" style="margin:0;display:inline;" onsubmit="return confirm('Delete this task?');">
+                                        <button type="submit" class="button delete-btn" style="margin:0;">Delete</button>
+                                    </form>
+                                </div>
+                                <form method="post" action="{{ url_for('edit_task', task_id=task.id) }}" enctype="multipart/form-data" id="edit-form-{{ task.id }}" style="display:none; margin-top: 20px;">
+                                    <button type="button" class="button" style="background:#eee;color:#333;margin-bottom:1rem;" onclick="stopEditingTask({{ task.id }})" id="stop-edit-btn-{{ task.id }}">Stop Editing Task</button>
+                                    <div class="form-group">
+                                        <label for="task_name_{{ task.id }}">Task Name</label>
+                                        <input type="text" id="task_name_{{ task.id }}" name="task_name" value="{{ task.name }}" required>
+                                    </div>
+                                    <div class="tabs">
+                                        <div class="tab-link active" onclick="openTab(event, 'text-rubric-{{ task.id }}')">Paste Rubric Text</div>
+                                        <div class="tab-link" onclick="openTab(event, 'file-rubric-{{ task.id }}')">Upload Rubric File</div>
+                                    </div>
+                                    <div id="text-rubric-{{ task.id }}" class="tab-content active">
+                                        <div class="form-group">
+                                            <label for="rubric_content_{{ task.id }}">Rubric (paste here)</label>
+                                            <textarea id="rubric_content_{{ task.id }}" name="rubric_content">{{ task.rubrics[0].content if task.rubrics else '' }}</textarea>
+                                        </div>
+                                    </div>
+                                    <div id="file-rubric-{{ task.id }}" class="tab-content">
+                                        <div class="form-group">
+                                            <label for="rubric_file_{{ task.id }}">Rubric File (PDF, PNG, JPG)</label>
+                                            <input type="file" id="rubric_file_{{ task.id }}" name="rubric_file" accept=".pdf,.png,.jpg,.jpeg">
+                                        </div>
+                                    </div>
+                                    <button type="submit" class="button" id="save-changes-btn-{{ task.id }}">Save Changes</button>
+                                </form>
+                                <form method="post" action="{{ url_for('raw_edit_task', task_id=task.id) }}" id="raw-edit-form-{{ task.id }}" style="display:none; margin-top: 20px;">
+                                    <button type="button" class="button" style="background:#eee;color:#333;margin-bottom:1rem;" onclick="stopRawEditingTask({{ task.id }})" id="stop-raw-edit-btn-{{ task.id }}">Stop Raw Edit</button>
+                                    <div class="form-group">
+                                        <label for="raw_rubric_content_{{ task.id }}">Rubric (raw Markdown, no LLM formatting)</label>
+                                        <textarea id="raw_rubric_content_{{ task.id }}" name="raw_rubric_content">{{ task.rubrics[0].content if task.rubrics else '' }}</textarea>
+                                    </div>
+                                    <button type="submit" class="button" id="save-raw-changes-btn-{{ task.id }}">Save Raw Changes</button>
+                                </form>
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+                <div style="display: flex; justify-content: center; margin: 1.5rem 0; gap: 1rem;">
+                    {% if tasks_paginated.has_prev %}
+                        <a href="?page={{ tasks_paginated.prev_num }}" class="button" style="background:#eee;color:#333;">&laquo; Previous</a>
+                    {% endif %}
+                    <span style="align-self: center; color: #888;">Page {{ tasks_paginated.page }} of {{ tasks_paginated.pages }}</span>
+                    {% if tasks_paginated.has_next %}
+                        <a href="?page={{ tasks_paginated.next_num }}" class="button" style="background:#eee;color:#333;">Next &raquo;</a>
+                    {% endif %}
+                </div>
+            {% else %}
+                <p>No tasks created yet. Use the form below to add one.</p>
+            {% endif %}
+            <div class="form-section">
+                <h2>Create New Task</h2>
+                <form method="post" action="{{ url_for('create_task') }}" enctype="multipart/form-data">
+                    <div class="form-group">
+                        <label for="task_name">Task Name</label>
+                        <input type="text" id="task_name" name="task_name" required>
+                    </div>
+                    <div class="tabs">
+                        <div class="tab-link active" onclick="openTab(event, 'text-rubric')">Paste Rubric Text</div>
+                        <div class="tab-link" onclick="openTab(event, 'file-rubric')">Upload Rubric File</div>
+                    </div>
+                    <div id="text-rubric" class="tab-content active">
+                        <div class="form-group">
+                            <label for="rubric_content">Rubric (paste here)</label>
+                            <textarea id="rubric_content" name="rubric_content"></textarea>
+                        </div>
+                    </div>
+                    <div id="file-rubric" class="tab-content">
+                        <div class="form-group">
+                            <label for="rubric_file">Rubric File (PDF, PNG, JPG)</label>
+                            <input type="file" id="rubric_file" name="rubric_file" accept=".pdf,.png,.jpg,.jpeg">
+                        </div>
+                    </div>
+                    <button type="submit" class="button" id="create-task-btn">Create Task</button>
+                </form>
+            </div>
+        </div>
+        <script>
+            // Accordion for task list
+            document.querySelectorAll('.task-header').forEach(header => {
+                header.addEventListener('click', () => {
+                    const content = header.nextElementSibling;
+                    content.style.display = content.style.display === 'block' ? 'none' : 'block';
+                });
+            });
+            // Tabs for form (global and per-task)
+            function openTab(evt, tabName) {
+                let i, tabcontent, tablinks, parent;
+                if(tabName.includes('-')) {
+                    // Per-task tab
+                    parent = evt.currentTarget.closest('.rubric-content');
+                    tabcontent = parent.getElementsByClassName('tab-content');
+                    tablinks = parent.getElementsByClassName('tab-link');
+                } else {
+                    tabcontent = document.getElementsByClassName('tab-content');
+                    tablinks = document.getElementsByClassName('tab-link');
+                }
+                for (i = 0; i < tabcontent.length; i++) {
+                    tabcontent[i].style.display = "none";
+                }
+                for (i = 0; i < tablinks.length; i++) {
+                    tablinks[i].className = tablinks[i].className.replace(" active", "");
+                }
+                document.getElementById(tabName).style.display = "block";
+                evt.currentTarget.className += " active";
+            }
+            // Show the edit form for a rubric (from inside the dropdown)
+            function showEditForm(taskId) {
+                // Hide all edit forms and show all markdowns
+                document.querySelectorAll('[id^="edit-form-"]').forEach(f => f.style.display = 'none');
+                document.querySelectorAll('[id^="raw-edit-form-"]').forEach(f => f.style.display = 'none');
+                document.querySelectorAll('[id^="rubric-markdown-"]').forEach(m => m.style.display = 'block');
+                // Show the edit form and hide the markdown for this task
+                document.getElementById('edit-form-' + taskId).style.display = 'block';
+                document.getElementById('rubric-markdown-' + taskId).style.display = 'none';
+                // Change the Edit Task button to Stop Editing Task
+                var editBtn = document.getElementById('edit-task-btn-' + taskId);
+                if (editBtn) {
+                    editBtn.style.display = 'none';
+                }
+                var rawEditBtn = document.getElementById('raw-edit-btn-' + taskId);
+                if (rawEditBtn) {
+                    rawEditBtn.style.display = '';
+                }
+            }
+            // Stop editing and return to view mode
+            function stopEditingTask(taskId) {
+                document.getElementById('edit-form-' + taskId).style.display = 'none';
+                document.getElementById('rubric-markdown-' + taskId).style.display = 'block';
+                var editBtn = document.getElementById('edit-task-btn-' + taskId);
+                if (editBtn) {
+                    editBtn.style.display = '';
+                }
+            }
+            // Show the raw edit form for a rubric (bypasses LLM)
+            function showRawEditForm(taskId) {
+                // Hide all edit forms and show all markdowns
+                document.querySelectorAll('[id^="edit-form-"]').forEach(f => f.style.display = 'none');
+                document.querySelectorAll('[id^="raw-edit-form-"]').forEach(f => f.style.display = 'none');
+                document.querySelectorAll('[id^="rubric-markdown-"]').forEach(m => m.style.display = 'block');
+                // Show the raw edit form and hide the markdown for this task
+                document.getElementById('raw-edit-form-' + taskId).style.display = 'block';
+                document.getElementById('rubric-markdown-' + taskId).style.display = 'none';
+                // Hide the Edit Task button while raw editing
+                var editBtn = document.getElementById('edit-task-btn-' + taskId);
+                if (editBtn) {
+                    editBtn.style.display = '';
+                }
+                var rawEditBtn = document.getElementById('raw-edit-btn-' + taskId);
+                if (rawEditBtn) {
+                    rawEditBtn.style.display = 'none';
+                }
+            }
+            // Stop raw editing and return to view mode
+            function stopRawEditingTask(taskId) {
+                document.getElementById('raw-edit-form-' + taskId).style.display = 'none';
+                document.getElementById('rubric-markdown-' + taskId).style.display = 'block';
+                var rawEditBtn = document.getElementById('raw-edit-btn-' + taskId);
+                if (rawEditBtn) {
+                    rawEditBtn.style.display = '';
+                }
+            }
+            // Depress and update text for Create Task and Save Changes buttons
+            document.addEventListener('DOMContentLoaded', function() {
+                var createBtn = document.getElementById('create-task-btn');
+                if (createBtn) {
+                    createBtn.addEventListener('click', function() {
+                        createBtn.disabled = true;
+                        createBtn.textContent = 'Creating Task...';
+                        createBtn.form.submit();
+                    });
+                }
+                document.querySelectorAll('[id^="save-changes-btn-"]').forEach(function(saveBtn) {
+                    saveBtn.addEventListener('click', function(e) {
+                        saveBtn.disabled = true;
+                        saveBtn.textContent = 'Saving Changes...';
+                        saveBtn.form.submit();
+                    });
+                });
+            });
+        </script>
+    </body>
+    </html>
+    """, tasks=tasks, tasks_paginated=tasks_paginated)
+
+@app.route('/create_task', methods=['POST'])
+def create_task():
+    """Handles the creation of a new task and its rubric."""
+    task_name = request.form.get('task_name')
+    rubric_content = request.form.get('rubric_content')
+    rubric_file = request.files.get('rubric_file')
+    raw_rubric_text = ""
+
+    if not task_name:
+        # Handle error: task name is required
+        return "Task name is required.", 400
+
+    if rubric_content:
+        raw_rubric_text = rubric_content
+    elif rubric_file and allowed_file(rubric_file.filename):
+        # Save the uploaded file temporarily to process it
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{timestamp}-{secure_filename(rubric_file.filename)}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        rubric_file.save(file_path)
+        
+        # Extract text using OCR
+        if filename.lower().endswith('.pdf'):
+            # For PDFs, convert the first page to an image first
+            images, err = convert_pdf_to_images(file_path)
+            if err or not images:
+                return "Failed to convert PDF rubric.", 500
+            ocr_target_path = images[0]
+        else:
+            ocr_target_path = file_path
+        
+        annotation = detect_document_text(ocr_target_path)
+        if annotation:
+            raw_rubric_text = annotation.text
+    
+    if not raw_rubric_text.strip():
+        # Handle error: rubric content is required
+        return "Rubric content is required, either via text or a valid file.", 400
+
+    # Use the agent to format the rubric
+    formatter = RubricFormattingAgent()
+    formatted_rubric = formatter.run(raw_rubric_text)
+
+    # Save to database
+    new_task = Task(name=task_name)
+    db.session.add(new_task)
+    db.session.commit()
+
+    new_rubric = Rubric(content=formatted_rubric, task_id=new_task.id)
+    db.session.add(new_rubric)
+    db.session.commit()
+
+    return redirect(url_for('index'))
+
+@app.route('/edit_task/<int:task_id>', methods=['POST'])
+def edit_task(task_id):
+    """Handles editing an existing task's name and rubric."""
+    task = Task.query.get_or_404(task_id)
+    rubric_content = request.form.get('rubric_content')
+    rubric_file = request.files.get('rubric_file')
+    raw_rubric_text = ""
+    if 'task_name' in request.form:
+        task.name = request.form['task_name']
+    if rubric_content:
+        raw_rubric_text = rubric_content
+    elif rubric_file and allowed_file(rubric_file.filename):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{timestamp}-{secure_filename(rubric_file.filename)}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        rubric_file.save(file_path)
+        if filename.lower().endswith('.pdf'):
+            images, err = convert_pdf_to_images(file_path)
+            if err or not images:
+                return "Failed to convert PDF rubric.", 500
+            ocr_target_path = images[0]
+        else:
+            ocr_target_path = file_path
+        annotation = detect_document_text(ocr_target_path)
+        if annotation:
+            raw_rubric_text = annotation.text
+    if raw_rubric_text.strip():
+        formatter = RubricFormattingAgent()
+        formatted_rubric = formatter.run(raw_rubric_text)
+        # Update or create rubric
+        if task.rubrics:
+            task.rubrics[0].content = formatted_rubric
+        else:
+            new_rubric = Rubric(content=formatted_rubric, task_id=task.id)
+            db.session.add(new_rubric)
+    db.session.commit()
+    return redirect(url_for('index'))
+
+@app.route('/delete_task/<int:task_id>', methods=['POST'])
+def delete_task(task_id):
+    """Handles deleting a task and its rubrics."""
+    task = Task.query.get_or_404(task_id)
+    for rubric in task.rubrics:
+        db.session.delete(rubric)
+    db.session.delete(task)
+    db.session.commit()
+    return redirect(url_for('index'))
+
+@app.route('/raw_edit_task/<int:task_id>', methods=['POST'])
+def raw_edit_task(task_id):
+    """Handles direct editing of a rubric's Markdown, bypassing the LLM."""
+    task = Task.query.get_or_404(task_id)
+    raw_rubric_content = request.form.get('raw_rubric_content')
+    if raw_rubric_content is not None:
+        if task.rubrics:
+            task.rubrics[0].content = raw_rubric_content
+        else:
+            new_rubric = Rubric(content=raw_rubric_content, task_id=task.id)
+            db.session.add(new_rubric)
+        db.session.commit()
+    return redirect(url_for('index'))
+
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
@@ -644,4 +1104,5 @@ if __name__ == '__main__':
     app.config['JOBS'] = jobs
 
     # setup_phoenix_tracing() # Tracing can be noisy with multiprocessing, disabling for now.
+    app.register_blueprint(pure_ocr_bp, url_prefix='/pureocr')
     app.run(debug=True, use_reloader=False) 
