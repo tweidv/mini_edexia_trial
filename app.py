@@ -30,16 +30,40 @@ migrate = Migrate(app, db)
 
 pure_ocr_bp = Blueprint('pure_ocr', __name__)
 
+class Student(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(128), nullable=False, unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    submissions = db.relationship('WorkSubmission', backref='student', lazy=True)
+
 class Task(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(128), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
     rubrics = db.relationship('Rubric', backref='task', lazy=True)
+    submissions = db.relationship('WorkSubmission', backref='task', lazy=True)
+    nudges = db.relationship('Nudge', backref='task', lazy=True)
 
 class Rubric(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.Text, nullable=False)
     task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+
+class WorkSubmission(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    student_id = db.Column(db.Integer, db.ForeignKey('student.id'), nullable=False)
+    filename = db.Column(db.String(256))
+    filetype = db.Column(db.String(32))
+    upload_time = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    raw_text = db.Column(db.Text)  # For pasted text or extracted text from docx/txt
+
+class Nudge(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    criterion = db.Column(db.String(128), nullable=False)
+    nudge_text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
 # --- Job Management Setup ---
@@ -732,6 +756,7 @@ def index():
     tasks_query = Task.query.order_by(Task.created_at.desc())
     tasks_paginated = tasks_query.paginate(page=page, per_page=per_page, error_out=False)
     tasks = tasks_paginated.items
+    students = Student.query.order_by(Student.name).all()
     return render_template_string("""
     <!DOCTYPE html>
     <html lang="en">
@@ -782,6 +807,78 @@ def index():
                                 </div>
                             </div>
                             <div class="rubric-content" id="rubric-content-{{ task.id }}" style="display:none;">
+                                <!-- Associated Work List -->
+                                <div style="margin-bottom: 1rem;">
+                                    <h4 style="margin:0 0 0.5rem 0;">Student Work</h4>
+                                    <ul style="list-style:none; padding:0; margin:0;">
+                                        {% for work in task.submissions %}
+                                            <li style="margin-bottom: 0.5rem; display: flex; align-items: center; gap: 1rem;">
+                                                <span style="font-weight:500;">{{ work.student.name }}</span>
+                                                <span style="color:#888; font-size:0.95em;">({{ work.upload_time.strftime('%Y-%m-%d %H:%M') }})</span>
+                                                <a href="#" class="button" style="background:#eee;color:#333;padding:4px 10px;font-size:14px;">Review</a>
+                                                <form method="post" action="{{ url_for('delete_work_submission', submission_id=work.id) }}" style="display:inline; margin:0;" onsubmit="return confirm('Delete this work submission?');">
+                                                    <button type="submit" class="button delete-btn" style="padding:4px 10px;font-size:14px;margin-left:6px;background:#d9534f;">Delete</button>
+                                                </form>
+                                            </li>
+                                        {% else %}
+                                            <li style="color:#888;">No work uploaded yet.</li>
+                                        {% endfor %}
+                                    </ul>
+                                    <button type="button" class="button" style="margin-top:0.5rem; padding:6px 16px; font-size:15px;" onclick="showAddWorkForm({{ task.id }})" id="add-work-btn-{{ task.id }}">Add Student Work</button>
+                                </div>
+                                <!-- Add Work Form (hidden by default) -->
+                                <div id="add-work-form-{{ task.id }}" style="display:none; margin-bottom:1.5rem;">
+                                    <form method="post" action="{{ url_for('add_work_submission', task_id=task.id) }}" enctype="multipart/form-data">
+                                        <div class="tabs">
+                                            <div class="tab-link active" onclick="openTab(event, 'upload-doc-{{ task.id }}')">Upload Document</div>
+                                            <div class="tab-link" onclick="openTab(event, 'paste-text-{{ task.id }}')">Paste Text</div>
+                                            <div class="tab-link" onclick="openTab(event, 'camera-{{ task.id }}')">Use Camera</div>
+                                        </div>
+                                        <div id="upload-doc-{{ task.id }}" class="tab-content active">
+                                            <div class="form-group">
+                                                <label for="work_file_{{ task.id }}">File (PDF, DOCX, TXT, Image)</label>
+                                                <input type="file" id="work_file_{{ task.id }}" name="work_file" accept=".pdf,.docx,.txt,.png,.jpg,.jpeg">
+                                            </div>
+                                        </div>
+                                        <div id="paste-text-{{ task.id }}" class="tab-content">
+                                            <div class="form-group">
+                                                <label for="work_text_{{ task.id }}">Paste Student Work</label>
+                                                <textarea id="work_text_{{ task.id }}" name="work_text"></textarea>
+                                            </div>
+                                        </div>
+                                        <div id="camera-{{ task.id }}" class="tab-content">
+                                            <div class="form-group">
+                                                <label>Capture Image</label><br>
+                                                <button type="button" class="button" id="start-camera-btn-{{ task.id }}">Start Camera</button>
+                                                <div id="camera-view-{{ task.id }}" style="display:none; margin-top:1rem;">
+                                                    <video id="camera-feed-{{ task.id }}" playsinline style="width:100%;max-width:350px;border-radius:4px;"></video>
+                                                    <div id="camera-capture-controls-{{ task.id }}" style="margin-top:1rem;">
+                                                        <button type="button" class="button" id="capture-photo-btn-{{ task.id }}">Capture</button>
+                                                    </div>
+                                                    <div id="camera-preview-{{ task.id }}" style="display:none; margin-top:1rem;">
+                                                        <img id="captured-image-{{ task.id }}" style="width:100%;max-width:350px;border-radius:4px;" />
+                                                        <div style="margin-top:1rem; display:flex; gap:10px;">
+                                                            <button type="button" class="button" id="retake-photo-btn-{{ task.id }}">Retake</button>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="student_{{ task.id }}">Student</label>
+                                            <select id="student_{{ task.id }}" name="student_id" required onchange="toggleNewStudentInput({{ task.id }})">
+                                                <option value="">Select student...</option>
+                                                {% for student in students %}
+                                                    <option value="{{ student.id }}">{{ student.name }}</option>
+                                                {% endfor %}
+                                                <option value="new">New Student</option>
+                                            </select>
+                                            <input type="text" name="new_student_name" id="new-student-input-{{ task.id }}" placeholder="Enter new student name" style="margin-top:6px;width:100%;display:none;">
+                                        </div>
+                                        <button type="submit" class="button">Upload Work</button>
+                                        <button type="button" class="button" style="background:#eee;color:#333;margin-left:10px;" onclick="hideAddWorkForm({{ task.id }})">Cancel</button>
+                                    </form>
+                                </div>
                                 <div id="rubric-markdown-{{ task.id }}" style="display:block;">
                                     {% if task.rubrics %}
                                         {{ task.rubrics[0].content | markdown | safe }}
@@ -867,6 +964,16 @@ def index():
                     </div>
                     <button type="submit" class="button" id="create-task-btn">Create Task</button>
                 </form>
+            </div>
+        </div>
+        <div id="no-work-modal" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;align-items:center;justify-content:center;background:rgba(0,0,0,0.4);z-index:10000;">
+            <div style="background:white;padding:2rem 2.5rem;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.2);text-align:center;max-width:350px;">
+                <h3 style="margin-top:0;">No work was provided</h3>
+                <p>Are you sure you want to continue? This will save a placeholder for this submission.</p>
+                <div style="margin-top:1.5rem;">
+                    <button type="button" class="button" id="no-work-continue-btn">Continue</button>
+                    <button type="button" class="button" style="background:#eee;color:#333;margin-left:10px;" id="no-work-cancel-btn">Cancel</button>
+                </div>
             </div>
         </div>
         <script>
@@ -972,10 +1079,141 @@ def index():
                     });
                 });
             });
+            // Tabs for form (global and per-task)
+            function showAddWorkForm(taskId) {
+                document.getElementById('add-work-form-' + taskId).style.display = 'block';
+                document.getElementById('add-work-btn-' + taskId).style.display = 'none';
+            }
+            function hideAddWorkForm(taskId) {
+                document.getElementById('add-work-form-' + taskId).style.display = 'none';
+                document.getElementById('add-work-btn-' + taskId).style.display = '';
+            }
+            // Camera logic for each Add Work form
+            function setupCameraForTask(taskId) {
+                const startCameraButton = document.getElementById('start-camera-btn-' + taskId);
+                const captureButton = document.getElementById('capture-photo-btn-' + taskId);
+                const cameraView = document.getElementById('camera-view-' + taskId);
+                const video = document.getElementById('camera-feed-' + taskId);
+                const previewDiv = document.getElementById('camera-preview-' + taskId);
+                const capturedImg = document.getElementById('captured-image-' + taskId);
+                const retakeBtn = document.getElementById('retake-photo-btn-' + taskId);
+                let stream;
+                let capturedBlob = null;
+                if (!startCameraButton || !captureButton || !cameraView || !video || !previewDiv || !capturedImg || !retakeBtn) return;
+                startCameraButton.addEventListener('click', async () => {
+                    try {
+                        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                        video.srcObject = stream;
+                        await video.play();
+                        startCameraButton.style.display = 'none';
+                        cameraView.style.display = 'block';
+                    } catch (err) {
+                        alert('Could not access the camera. Please ensure you have given permission and are using a secure connection (https).');
+                    }
+                });
+                captureButton.addEventListener('click', () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    canvas.getContext('2d').drawImage(video, 0, 0);
+                    canvas.toBlob(blob => {
+                        capturedBlob = blob;
+                        const url = URL.createObjectURL(blob);
+                        capturedImg.src = url;
+                        previewDiv.style.display = 'block';
+                        video.style.display = 'none';
+                        captureButton.style.display = 'none';
+                    }, 'image/jpeg');
+                });
+                retakeBtn.addEventListener('click', () => {
+                    previewDiv.style.display = 'none';
+                    video.style.display = 'block';
+                    captureButton.style.display = '';
+                    capturedImg.src = '';
+                    capturedBlob = null;
+                });
+                // Remove upload button logic; form submission will handle the upload if capturedBlob is present
+                // On form submit, if a capturedBlob exists, append it as work_camera
+                const form = document.getElementById('add-work-form-' + taskId).querySelector('form');
+                form.addEventListener('submit', function(e) {
+                    if (capturedBlob) {
+                        // Remove any previous file/text
+                        const formData = new FormData(form);
+                        formData.delete('work_file');
+                        formData.delete('work_text');
+                        formData.append('work_camera', capturedBlob, 'capture.jpg');
+                        e.preventDefault();
+                        fetch(form.action, {
+                            method: 'POST',
+                            body: formData
+                        }).then(response => {
+                            if (response.redirected) {
+                                window.location.href = response.url;
+                            } else {
+                                window.location.reload();
+                            }
+                        }).catch(() => window.location.reload());
+                    }
+                });
+            }
+            // Show/hide new student input
+            function toggleNewStudentInput(taskId) {
+                var select = document.getElementById('student_' + taskId);
+                var input = document.getElementById('new-student-input-' + taskId);
+                if (select.value === 'new') {
+                    input.style.display = '';
+                } else {
+                    input.style.display = 'none';
+                }
+            }
+            // Setup camera for all tasks on DOMContentLoaded
+            document.addEventListener('DOMContentLoaded', function() {
+                {% for task in tasks %}
+                    setupCameraForTask({{ task.id }});
+                {% endfor %}
+            });
+            // --- No Work Provided Modal Logic ---
+            document.querySelectorAll('[id^="add-work-form-"]').forEach(function(formDiv) {
+                var form = formDiv.querySelector('form');
+                if (!form) return;
+                form.addEventListener('submit', function(e) {
+                    // Only check for work if not already forcing save
+                    if (form.querySelector('[name="force_save"]') && form.querySelector('[name="force_save"]').value === '1') return;
+                    var fileInput = form.querySelector('input[name="work_file"]');
+                    var textInput = form.querySelector('textarea[name="work_text"]');
+                    var cameraInput = form.querySelector('input[name="work_camera"]');
+                    var hasFile = fileInput && fileInput.files && fileInput.files.length > 0;
+                    var hasText = textInput && textInput.value.trim().length > 0;
+                    var hasCamera = cameraInput && cameraInput.files && cameraInput.files.length > 0;
+                    if (!hasFile && !hasText && !hasCamera) {
+                        e.preventDefault();
+                        window._noWorkForm = form;
+                        document.getElementById('no-work-modal').style.display = 'flex';
+                    }
+                });
+            });
+            var continueBtn = document.getElementById('no-work-continue-btn');
+            var cancelBtn = document.getElementById('no-work-cancel-btn');
+            if (continueBtn && cancelBtn) {
+                continueBtn.onclick = function() {
+                    if (window._noWorkForm) {
+                        var hidden = document.createElement('input');
+                        hidden.type = 'hidden';
+                        hidden.name = 'force_save';
+                        hidden.value = '1';
+                        window._noWorkForm.appendChild(hidden);
+                        window._noWorkForm.submit();
+                    }
+                    document.getElementById('no-work-modal').style.display = 'none';
+                };
+                cancelBtn.onclick = function() {
+                    document.getElementById('no-work-modal').style.display = 'none';
+                };
+            }
         </script>
     </body>
     </html>
-    """, tasks=tasks, tasks_paginated=tasks_paginated)
+    """, tasks=tasks, tasks_paginated=tasks_paginated, students=students)
 
 @app.route('/create_task', methods=['POST'])
 def create_task():
@@ -1091,6 +1329,65 @@ def raw_edit_task(task_id):
             new_rubric = Rubric(content=raw_rubric_content, task_id=task.id)
             db.session.add(new_rubric)
         db.session.commit()
+    return redirect(url_for('index'))
+
+@app.route('/add_work_submission/<int:task_id>', methods=['POST'])
+def add_work_submission(task_id):
+    """Handles uploading student work for a task."""
+    task = Task.query.get_or_404(task_id)
+    student_id = request.form.get('student_id')
+    new_student_name = request.form.get('new_student_name')
+    work_file = request.files.get('work_file')
+    work_text = request.form.get('work_text')
+    work_camera = request.files.get('work_camera')
+    student = None
+    if new_student_name and new_student_name.strip():
+        student = Student(name=new_student_name.strip())
+        db.session.add(student)
+        db.session.commit()
+    elif student_id:
+        student = Student.query.get(student_id)
+    if not student:
+        return "Student is required.", 400
+    filename = None
+    filetype = None
+    raw_text = None
+    if work_file and work_file.filename:
+        filename = secure_filename(work_file.filename)
+        filetype = filename.split('.')[-1].lower()
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        work_file.save(file_path)
+    elif work_camera and work_camera.filename:
+        filename = secure_filename(work_camera.filename)
+        filetype = filename.split('.')[-1].lower()
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        work_camera.save(file_path)
+    elif work_text and work_text.strip():
+        raw_text = work_text.strip()
+        filetype = 'txt'
+    elif request.form.get('force_save') == '1':
+        # User pressed continue in modal, save with default values
+        filetype = 'none'
+        raw_text = '(no work provided)'
+        filename = None
+    else:
+        return redirect(url_for('index'))
+    submission = WorkSubmission(
+        task_id=task.id,
+        student_id=student.id,
+        filename=filename,
+        filetype=filetype,
+        raw_text=raw_text
+    )
+    db.session.add(submission)
+    db.session.commit()
+    return redirect(url_for('index'))
+
+@app.route('/delete_work_submission/<int:submission_id>', methods=['POST'])
+def delete_work_submission(submission_id):
+    submission = WorkSubmission.query.get_or_404(submission_id)
+    db.session.delete(submission)
+    db.session.commit()
     return redirect(url_for('index'))
 
 
