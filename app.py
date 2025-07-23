@@ -5,7 +5,7 @@ from PIL import Image, ImageDraw, ImageOps
 import io
 from dotenv import load_dotenv
 import base64
-from werkzeug.utils import secure_filename
+from werkzeug.utils import secure_filename, safe_join
 import datetime
 import fitz  # PyMuPDF
 import google.generativeai as genai
@@ -22,6 +22,9 @@ from script_marker_agent.agent import RubricCriterionExtractorAgent, MainMarkerA
 import threading
 import time
 import shelve
+import tempfile
+import shutil
+import json
 
 load_dotenv()
 genai.configure()
@@ -61,6 +64,7 @@ class WorkSubmission(db.Model):
     filetype = db.Column(db.String(32))
     upload_time = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
     raw_text = db.Column(db.Text)  # For pasted text or extracted text from docx/txt
+    cache_dir = db.Column(db.String(256), nullable=True)
 
 class Nudge(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -744,8 +748,11 @@ def job_status(job_id):
 
 @pure_ocr_bp.route('/uploads/<path:filename>')
 def serve_upload(filename):
-    """Serves files from the uploads directory."""
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    # Serve files from any subdirectory under uploads/
+    uploads_dir = app.config['UPLOAD_FOLDER']
+    # Use safe_join to prevent directory traversal
+    file_path = safe_join(uploads_dir, filename)
+    return send_from_directory(uploads_dir, filename)
 
 @app.template_filter('markdown')
 def markdown_filter(s):
@@ -1337,7 +1344,7 @@ def raw_edit_task(task_id):
 
 @app.route('/add_work_submission/<int:task_id>', methods=['POST'])
 def add_work_submission(task_id):
-    """Handles uploading student work for a task."""
+    import time
     task = Task.query.get_or_404(task_id)
     student_id = request.form.get('student_id')
     new_student_name = request.form.get('new_student_name')
@@ -1356,21 +1363,28 @@ def add_work_submission(task_id):
     filename = None
     filetype = None
     raw_text = None
+    cache_dir = None
     if work_file and work_file.filename:
         filename = secure_filename(work_file.filename)
         filetype = filename.split('.')[-1].lower()
+        # Generate unique cache dir: timestamp + name (no extension)
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        base_name = os.path.splitext(filename)[0]
+        cache_dir = f'{timestamp}-{base_name}'
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         work_file.save(file_path)
     elif work_camera and work_camera.filename:
         filename = secure_filename(work_camera.filename)
         filetype = filename.split('.')[-1].lower()
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        base_name = os.path.splitext(filename)[0]
+        cache_dir = f'{timestamp}-{base_name}'
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         work_camera.save(file_path)
     elif work_text and work_text.strip():
         raw_text = work_text.strip()
         filetype = 'txt'
     elif request.form.get('force_save') == '1':
-        # User pressed continue in modal, save with default values
         filetype = 'none'
         raw_text = '(no work provided)'
         filename = None
@@ -1381,10 +1395,52 @@ def add_work_submission(task_id):
         student_id=student.id,
         filename=filename,
         filetype=filetype,
-        raw_text=raw_text
+        raw_text=raw_text,
+        cache_dir=cache_dir
     )
     db.session.add(submission)
     db.session.commit()
+    # --- One-time processing and caching for PDF/DOCX ---
+    if filename and filetype in ['pdf', 'docx']:
+        from app import process_image_pipeline, convert_pdf_to_images
+        import tempfile, shutil
+        import pythoncom
+        submission_id = submission.id
+        cache_path = os.path.join(app.config['UPLOAD_FOLDER'], cache_dir)
+        os.makedirs(cache_path, exist_ok=True)
+        pdf_path = None
+        temp_dir = None
+        if filetype == 'docx':
+            from docx2pdf import convert
+            temp_dir = tempfile.mkdtemp()
+            docx_path = file_path
+            pdf_path = os.path.join(temp_dir, os.path.splitext(filename)[0] + '.pdf')
+            pythoncom.CoInitialize()
+            try:
+                convert(docx_path, pdf_path)
+            finally:
+                pythoncom.CoUninitialize()
+        else:
+            pdf_path = file_path
+        image_paths, error = convert_pdf_to_images(pdf_path)
+        manifest = []
+        for i, img_path in enumerate(image_paths):
+            img_filename = f'page-{i+1}.png'
+            cached_img_path = os.path.join(cache_path, img_filename)
+            shutil.copy(img_path, cached_img_path)
+            results, err = process_image_pipeline(img_path)
+            word_data = results.get('word_data', []) if results else []
+            dims = results.get('original_dimensions', {}) if results else {}
+            manifest.append({
+                'img': img_filename,
+                'word_data': word_data,
+                'width': dims.get('width'),
+                'height': dims.get('height')
+            })
+        with open(os.path.join(cache_path, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        if temp_dir:
+            shutil.rmtree(temp_dir)
     return redirect(url_for('index'))
 
 @app.route('/delete_work_submission/<int:submission_id>', methods=['POST'])
@@ -1396,6 +1452,10 @@ def delete_work_submission(submission_id):
 
 @app.route('/review_work/<int:submission_id>')
 def review_work(submission_id):
+    from app import process_image_pipeline, convert_pdf_to_images  # Always import at the top of the function
+    import tempfile
+    import shutil
+    import json
     submission = WorkSubmission.query.get_or_404(submission_id)
     task = submission.task
     rubric = task.rubrics[0] if task.rubrics else None
@@ -1406,25 +1466,59 @@ def review_work(submission_id):
     filetype = submission.filetype or ''
     file_url = None
     text_content = None
+    page_images = []  # List of dicts: {url, word_data, width, height}
     if rubric:
         extractor = RubricCriterionExtractorAgent()
         criteria = extractor.run(rubric.content)
-    # Determine if we need to OCR or can use text directly
-    if submission.raw_text and submission.filetype == 'txt':
-        refined_text = submission.raw_text
-        status = 'Marking text...'
-        # Do not run the agent server-side; let the frontend always call /api/mark_work for consistency
-        analysis = None
-        status = 'Complete'
-    elif submission.filename:
-        # Need to OCR the file (image/pdf)
-        file_url = url_for('pure_ocr.serve_upload', filename=submission.filename)
-        status = 'Detecting text in image/pdf...'
-        # Call the Pure OCR API endpoint to get refined text
-        # (Assume /pureocr/api/job_status/<job_id> or similar is available)
-        # For now, just show status and a spinner, and use JS to poll for results
-    else:
-        status = 'No work uploaded.'
+    # Try to load manifest cache for any filetype with a filename or cache_dir
+    manifest_loaded = False
+    cache_dir = getattr(submission, 'cache_dir', None)
+    if cache_dir:
+        cache_path = os.path.join(app.config['UPLOAD_FOLDER'], cache_dir)
+        manifest_path = os.path.join(cache_path, 'manifest.json')
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            for i, page in enumerate(manifest):
+                img_url = url_for('pure_ocr.serve_upload', filename=f'{cache_dir}/' + page['img'])
+                page_images.append({
+                    'url': img_url,
+                    'word_data': page['word_data'],
+                    'width': page['width'],
+                    'height': page['height']
+                })
+            status = 'Document loaded from cache.'
+            manifest_loaded = True
+    # If not loaded from manifest, fall back to previous logic
+    if not manifest_loaded:
+        print('[WARNING] No cache_dir or manifest found for this submission. Falling back to old logic.')
+        if submission.raw_text and submission.filetype == 'txt':
+            refined_text = submission.raw_text
+            status = 'Marking text...'
+            analysis = None
+            status = 'Complete'
+        elif submission.filename:
+            if filetype in ['png', 'jpg', 'jpeg', 'gif']:
+                file_url = url_for('pure_ocr.serve_upload', filename=submission.filename)
+                results, err = process_image_pipeline(os.path.join(app.config['UPLOAD_FOLDER'], submission.filename))
+                if err:
+                    word_data = []
+                    width = height = None
+                else:
+                    word_data = results.get('word_data', [])
+                    dims = results.get('original_dimensions', {})
+                    width = dims.get('width')
+                    height = dims.get('height')
+                page_images.append({
+                    'url': file_url,
+                    'word_data': word_data,
+                    'width': width,
+                    'height': height
+                })
+            else:
+                file_url = url_for('pure_ocr.serve_upload', filename=submission.filename)
+        else:
+            status = 'No work uploaded.'
     return render_template_string("""
     <!DOCTYPE html>
     <html lang="en">
@@ -1432,9 +1526,9 @@ def review_work(submission_id):
         <meta charset="UTF-8">
         <title>Review Student Work</title>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; margin: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; margin: 0; }
             .review-layout { display: flex; height: 100vh; }
-            .review-left { flex: 2; overflow-y: auto; background: #fff; padding: 2rem; border-right: 1px solid #eee; }
+            .review-left { flex: 2.5; overflow-y: auto; background: #fff; padding: 2rem; border-right: 1px solid #eee; }
             .review-right { flex: 1; overflow-y: auto; background: #fafbfc; padding: 2rem; position: sticky; top: 0; height: 100vh; }
             .rubric-criterion { background: #e0e0e0; border-radius: 8px; margin-bottom: 1.5rem; padding: 1.2rem 1.5rem; color: #333; box-shadow: 0 2px 6px rgba(0,0,0,0.04); transition: background 0.2s; }
             .rubric-criterion .mark { font-weight: bold; font-size: 1.2em; }
@@ -1443,6 +1537,13 @@ def review_work(submission_id):
             .status-box { position: fixed; top: 2rem; right: 2rem; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 1rem 1.5rem; z-index: 1000; font-size: 1.1em; color: #333; display: flex; align-items: center; gap: 0.7em; }
             .spinner { width: 22px; height: 22px; border: 3px solid #eee; border-top: 3px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .ocr-page-img-wrapper { position: relative; margin-bottom: 2.5em; }
+            .ocr-page-img { width: 100%; max-width: none; display: block; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
+            .highlight { position: absolute; border: 2px solid #00b894; background: rgba(0,184,148,0.18); pointer-events: none; border-radius: 2px; }
+            .highlight.green { background: rgba(0,255,0,0.18); border-color: #00b894; }
+            .highlight.yellow { background: rgba(255,255,0,0.18); border-color: #cca300; }
+            .search-section { text-align: left; margin-bottom: 2rem; }
+            .search-section input { padding: 10px; font-size: 16px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
         </style>
     </head>
     <body>
@@ -1457,14 +1558,19 @@ def review_work(submission_id):
                 <div style="color:#666;font-size:1.1em;margin-bottom:1.5em;">
                     {{ submission.student.name }} - {{ submission.upload_time.strftime('%d-%m-%Y %H:%M') }}
                 </div>
-                {% if file_url %}
-                    {% if filetype in ['png', 'jpg', 'jpeg', 'gif'] %}
-                        <img src="{{ file_url }}" style="max-width:100%;border-radius:8px;" />
-                    {% elif filetype == 'pdf' %}
-                        <iframe src="{{ file_url }}" style="width:100%;height:80vh;border:none;"></iframe>
-                    {% else %}
-                        <a href="{{ file_url }}" target="_blank">Download file</a>
-                    {% endif %}
+                <div class="search-section">
+                    <input type="text" id="search-bar" placeholder="Type to highlight words...">
+                </div>
+                {% if page_images and page_images|length > 0 %}
+                    {% for page in page_images %}
+                        <div class="ocr-page-img-wrapper" style="position:relative;">
+                            <img src="{{ page.url }}" class="ocr-page-img" id="ocr-img-{{ loop.index0 }}" data-page-index="{{ loop.index0 }}" data-width="{{ page.width }}" data-height="{{ page.height }}" />
+                            <div class="highlight-overlay" id="highlight-overlay-{{ loop.index0 }}" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></div>
+                            <script type="application/json" id="word-data-{{ loop.index0 }}">{{ page.word_data|tojson }}</script>
+                        </div>
+                    {% endfor %}
+                {% elif file_url %}
+                    <img src="{{ file_url }}" style="width:100%;max-width:none;border-radius:8px;" />
                 {% elif refined_text %}
                     <pre style="background:#f7f7f7;padding:1.5rem;border-radius:8px;">{{ refined_text }}</pre>
                 {% else %}
@@ -1486,7 +1592,55 @@ def review_work(submission_id):
             </div>
         </div>
         <script>
-        // Synchronous marking: single request, no polling
+        // --- Highlighting Logic (reused from Pure OCR) ---
+        function renderHighlights(pageIdx, searchTerm) {
+            const wordData = JSON.parse(document.getElementById('word-data-' + pageIdx).textContent);
+            const img = document.getElementById('ocr-img-' + pageIdx);
+            const overlay = document.getElementById('highlight-overlay-' + pageIdx);
+            overlay.innerHTML = '';
+            if (!searchTerm) return;
+            const imgWidth = img.naturalWidth;
+            const imgHeight = img.naturalHeight;
+            wordData.forEach((word, idx) => {
+                let className = 'highlight';
+                let shouldHighlight = false;
+                if (word.text.includes(searchTerm)) {
+                    className += ' green';
+                    shouldHighlight = true;
+                } else if (word.text.toLowerCase().includes(searchTerm.toLowerCase())) {
+                    className += ' yellow';
+                    shouldHighlight = true;
+                }
+                if (shouldHighlight && word.vertices && word.vertices.length === 4) {
+                    // Scale vertices to overlay size
+                    const x = word.vertices[0].x / imgWidth * 100;
+                    const y = word.vertices[0].y / imgHeight * 100;
+                    const w = (word.vertices[1].x - word.vertices[0].x) / imgWidth * 100;
+                    const h = (word.vertices[2].y - word.vertices[1].y) / imgHeight * 100;
+                    const div = document.createElement('div');
+                    div.className = className;
+                    div.style.position = 'absolute';
+                    div.style.left = x + '%';
+                    div.style.top = y + '%';
+                    div.style.width = w + '%';
+                    div.style.height = h + '%';
+                    overlay.appendChild(div);
+                }
+            });
+        }
+        function setupAllHighlights() {
+            const searchBar = document.getElementById('search-bar');
+            const pageCount = {{ page_images|length }};
+            function updateAll() {
+                for (let i = 0; i < pageCount; i++) {
+                    renderHighlights(i, searchBar.value);
+                }
+            }
+            searchBar.addEventListener('input', updateAll);
+            window.addEventListener('load', updateAll);
+        }
+        setupAllHighlights();
+        // --- Marking/Analysis Update Logic ---
         let statusText = document.getElementById('status-text');
         let statusSpinner = document.getElementById('status-spinner');
         let rubricRight = document.getElementById('rubric-right');
@@ -1545,10 +1699,15 @@ def review_work(submission_id):
         </script>
     </body>
     </html>
-    """, file_url=file_url, filetype=filetype, refined_text=refined_text, criteria=criteria, analysis=analysis, status=status, submission=submission)
+    """, file_url=file_url, filetype=filetype, refined_text=refined_text, criteria=criteria, analysis=analysis, status=status, submission=submission, page_images=page_images)
 
 @app.route('/api/mark_work/<int:submission_id>', methods=['GET'])
 def api_mark_work(submission_id):
+    from app import process_image_pipeline, convert_pdf_to_images
+    import tempfile
+    import shutil
+    import traceback
+    import json
     submission = WorkSubmission.query.get_or_404(submission_id)
     task = submission.task
     rubric = task.rubrics[0] if task.rubrics else None
@@ -1557,53 +1716,88 @@ def api_mark_work(submission_id):
     # Step 1: Get text (OCR if needed)
     refined_text = None
     filetype = submission.filetype or ''
-    if submission.raw_text and submission.filetype == 'txt':
-        refined_text = submission.raw_text
-    elif submission.filename:
-        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, submission.filename))
-        ocr_result_path = os.path.join(app.config['UPLOAD_FOLDER'], f'{job_id}.txt')
-        if os.path.exists(ocr_result_path):
-            with open(ocr_result_path, 'r', encoding='utf-8') as f:
-                refined_text = f.read()
+    try:
+        if submission.raw_text and submission.filetype == 'txt':
+            print('[DEBUG] Using raw text for marking.')
+            refined_text = submission.raw_text
+        elif submission.filename:
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, submission.filename))
+            ocr_result_path = os.path.join(app.config['UPLOAD_FOLDER'], f'{job_id}.txt')
+            if os.path.exists(ocr_result_path):
+                print(f'[DEBUG] Using cached OCR result: {ocr_result_path}')
+                with open(ocr_result_path, 'r', encoding='utf-8') as f:
+                    refined_text = f.read()
+            else:
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], submission.filename)
+                cache_dir = getattr(submission, 'cache_dir', None)
+                if cache_dir:
+                    cache_path = os.path.join(app.config['UPLOAD_FOLDER'], cache_dir)
+                    manifest_path = os.path.join(cache_path, 'manifest.json')
+                    if os.path.exists(manifest_path):
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            manifest = json.load(f)
+                        all_refined_texts = []
+                        for page in manifest:
+                            page_text = ' '.join([w['text'] for w in page['word_data']])
+                            all_refined_texts.append(page_text)
+                        refined_text = '\n\n'.join(all_refined_texts)
+                        print('[DEBUG] Loaded refined text from manifest cache.')
+                    else:
+                        print('[DEBUG] No manifest cache found, fallback to processing.')
+                        return jsonify({'status': 'error', 'error': 'No manifest cache found for this submission.'}), 500
+                else:
+                    print(f'[DEBUG] Running OCR pipeline on image: {file_path}')
+                    results, error = process_image_pipeline(file_path)
+                    if error:
+                        print(f'[ERROR] OCR pipeline failed: {error}')
+                        return jsonify({'status': 'error', 'error': error}), 500
+                    refined_text = results['refined_text']
+                with open(ocr_result_path, 'w', encoding='utf-8') as f:
+                    f.write(refined_text)
+                    print(f'[DEBUG] Wrote OCR result to cache: {ocr_result_path}')
         else:
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], submission.filename)
-            results, error = process_image_pipeline(file_path)
-            if error:
-                return jsonify({'status': 'error', 'error': error}), 500
-            refined_text = results['refined_text']
-            with open(ocr_result_path, 'w', encoding='utf-8') as f:
-                f.write(refined_text)
-    else:
-        return jsonify({'status': 'error', 'error': 'No work uploaded.'}), 400
-    # Extract criteria
-    extractor = RubricCriterionExtractorAgent()
-    criteria = extractor.run(rubric.content)
-    # Synchronous marking: run if not already done
-    key = get_marking_result_key(submission_id)
-    with shelve.open(MARKING_RESULTS_DB) as db:
-        if key in db and all(db[key][c]["status"] == "complete" for c in criteria):
-            result = db[key]
-        else:
-            # Run marking synchronously
-            result = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing"} for c in criteria}
-            db[key] = result
-            main_agent = MainMarkerAgent()
-            main_output = main_agent.run(rubric.content, refined_text)
-            for c in criteria:
-                mark_agent = MarkExtractionAgent()
-                reasoning_agent = ReasoningExtractionAgent()
-                evidence_agent = EvidenceExtractionAgent()
-                mark = mark_agent.run(main_output, c)
-                reasoning = reasoning_agent.run(main_output, c)
-                evidence = evidence_agent.run(main_output, c)
-                result[c] = {
-                    "suggested_mark": mark,
-                    "reasoning": reasoning,
-                    "evidence_justification": evidence,
-                    "status": "complete"
-                }
-            db[key] = result
-    return jsonify({'status': 'complete', 'refined_text': refined_text, 'analysis': result})
+            print('[ERROR] No work uploaded.')
+            return jsonify({'status': 'error', 'error': 'No work uploaded.'}), 400
+        # Extract criteria
+        extractor = RubricCriterionExtractorAgent()
+        criteria = extractor.run(rubric.content)
+        print(f'[DEBUG] Extracted criteria: {criteria}')
+        # Synchronous marking: run if not already done
+        key = get_marking_result_key(submission_id)
+        with shelve.open(MARKING_RESULTS_DB) as db:
+            if key in db and all(db[key][c]["status"] == "complete" for c in criteria):
+                print('[DEBUG] Using cached marking result.')
+                result = db[key]
+            else:
+                print('[DEBUG] Running marking agents...')
+                result = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing"} for c in criteria}
+                db[key] = result
+                main_agent = MainMarkerAgent()
+                main_output = main_agent.run(rubric.content, refined_text)
+                print(f'[DEBUG] Main marker output:\n{main_output}\n')
+                for c in criteria:
+                    mark_agent = MarkExtractionAgent()
+                    reasoning_agent = ReasoningExtractionAgent()
+                    evidence_agent = EvidenceExtractionAgent()
+                    mark = mark_agent.run(main_output, c)
+                    print(f"[DEBUG] Mark for '{c}': {mark}")
+                    reasoning = reasoning_agent.run(main_output, c)
+                    print(f"[DEBUG] Reasoning for '{c}': {reasoning}")
+                    evidence = evidence_agent.run(main_output, c)
+                    print(f"[DEBUG] Evidence for '{c}': {evidence}")
+                    result[c] = {
+                        "suggested_mark": mark,
+                        "reasoning": reasoning,
+                        "evidence_justification": evidence,
+                        "status": "complete"
+                    }
+                db[key] = result
+        print('[DEBUG] Marking complete. Returning result.')
+        return jsonify({'status': 'complete', 'refined_text': refined_text, 'analysis': result})
+    except Exception as e:
+        print('[EXCEPTION] Exception during marking:', str(e))
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 # In-memory or persistent store for progressive marking results (for demo, use shelve)
 MARKING_RESULTS_DB = 'marking_results_db'
