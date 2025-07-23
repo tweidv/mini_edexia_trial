@@ -1,2 +1,3 @@
 credentials/gcloud_vision_key.json
-.env 
+.env
+uploads/ 

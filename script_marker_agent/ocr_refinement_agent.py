@@ -5,11 +5,6 @@ from PIL import Image
 import io
 import base64
 
-# Configure the generative AI client
-# Make sure your .env file has GOOGLE_API_KEY
-# and GOOGLE_GENAI_USE_VERTEXAI=FALSE
-genai.configure()
-
 class OcrRefinementAgent(adk_agents.Agent):
     """
     An agent that refines raw OCR text by correcting errors,
