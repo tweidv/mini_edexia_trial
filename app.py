@@ -55,6 +55,7 @@ class Rubric(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.Text, nullable=False)
     task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    rubric_type = db.Column(db.String(32), nullable=False, default='text')
 
 class WorkSubmission(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -103,8 +104,9 @@ def detect_document_text(image_path):
     return response.full_text_annotation
 
 def extract_word_data_from_annotation(text_annotation):
-    """Extracts text and bounding box vertices for each word."""
+    """Extracts text and bounding box vertices for each word, and assigns a line number."""
     word_data = []
+    line_num = 0
     for page in text_annotation.pages:
         for block in page.blocks:
             for paragraph in block.paragraphs:
@@ -113,8 +115,14 @@ def extract_word_data_from_annotation(text_annotation):
                     vertices = [{'x': v.x, 'y': v.y} for v in word.bounding_box.vertices]
                     word_data.append({
                         "text": word_text,
-                        "vertices": vertices
+                        "vertices": vertices,
+                        "line_num": line_num
                     })
+                    # Check for line break in the last symbol
+                    if hasattr(word.symbols[-1], 'property') and hasattr(word.symbols[-1].property, 'detected_break'):
+                        break_type = word.symbols[-1].property.detected_break.type
+                        if break_type == 3:  # 3 = LINE_BREAK
+                            line_num += 1
     return word_data
 
 # HTML Template for the page
@@ -1221,6 +1229,7 @@ def index():
                     document.getElementById('no-work-modal').style.display = 'none';
                 };
             }
+
         </script>
     </body>
     </html>
@@ -1542,8 +1551,6 @@ def review_work(submission_id):
             .highlight { position: absolute; border: 2px solid #00b894; background: rgba(0,184,148,0.18); pointer-events: none; border-radius: 2px; }
             .highlight.green { background: rgba(0,255,0,0.18); border-color: #00b894; }
             .highlight.yellow { background: rgba(255,255,0,0.18); border-color: #cca300; }
-            .search-section { text-align: left; margin-bottom: 2rem; }
-            .search-section input { padding: 10px; font-size: 16px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
         </style>
     </head>
     <body>
@@ -1558,9 +1565,6 @@ def review_work(submission_id):
                 <h2>{{ submission.task.name }}</h2>
                 <div style="color:#666;font-size:1.1em;margin-bottom:1.5em;">
                     {{ submission.student.name }} - {{ submission.upload_time.strftime('%d-%m-%Y %H:%M') }}
-                </div>
-                <div class="search-section">
-                    <input type="text" id="search-bar" placeholder="Type to highlight words...">
                 </div>
                 {% if page_images and page_images|length > 0 %}
                     {% for page in page_images %}
@@ -1625,22 +1629,86 @@ def review_work(submission_id):
                 overlay.innerHTML = '';
                 const imgWidth = img.naturalWidth;
                 const imgHeight = img.naturalHeight;
-                wordData.forEach((word, widx) => {
-                    if (highlights.includes(word.text) && word.vertices && word.vertices.length === 4) {
-                        const x = word.vertices[0].x / imgWidth * 100;
-                        const y = word.vertices[0].y / imgHeight * 100;
-                        const w = (word.vertices[1].x - word.vertices[0].x) / imgWidth * 100;
-                        const h = (word.vertices[2].y - word.vertices[1].y) / imgHeight * 100;
-                        const div = document.createElement('div');
-                        div.className = 'highlight';
-                        div.style.position = 'absolute';
-                        div.style.left = x + '%';
-                        div.style.top = y + '%';
-                        div.style.width = w + '%';
-                        div.style.height = h + '%';
-                        div.style.background = color.replace(')', ', 0.15)').replace('hsl', 'hsla');
-                        div.style.borderColor = color;
-                        overlay.appendChild(div);
+
+                // Helper: get bounding box for a range of words
+                function getBoundingBox(words) {
+                    let xs = [], ys = [];
+                    words.forEach(word => {
+                        word.vertices.forEach(v => {
+                            xs.push(v.x);
+                            ys.push(v.y);
+                        });
+                    });
+                    let minX = Math.min(...xs), maxX = Math.max(...xs);
+                    let minY = Math.min(...ys), maxY = Math.max(...ys);
+                    return {
+                        x: minX / imgWidth * 100,
+                        y: minY / imgHeight * 100,
+                        w: (maxX - minX) / imgWidth * 100,
+                        h: (maxY - minY) / imgHeight * 100
+                    };
+                }
+
+                // For each phrase in highlights
+                highlights.forEach(phrase => {
+                    if (!phrase) return;
+                    const phraseWords = phrase.split(/\s+/);
+                    for (let i = 0; i <= wordData.length - phraseWords.length; i++) {
+                        let match = true;
+                        for (let j = 0; j < phraseWords.length; j++) {
+                            if (wordData[i + j].text !== phraseWords[j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            // Get line numbers for first and last word
+                            const firstIdx = i;
+                            const lastIdx = i + phraseWords.length - 1;
+                            const firstLine = wordData[firstIdx].line_num;
+                            const lastLine = wordData[lastIdx].line_num;
+                            // Group words by line_num
+                            let lines = {};
+                            for (let k = firstIdx; k <= lastIdx; k++) {
+                                const ln = wordData[k].line_num;
+                                if (!lines[ln]) lines[ln] = [];
+                                lines[ln].push(wordData[k]);
+                            }
+                            const lineNums = Object.keys(lines).map(Number).sort((a, b) => a - b);
+                            // For each line in the phrase
+                            lineNums.forEach((ln, idx) => {
+                                const wordsOnLine = lines[ln];
+                                let wordsToHighlight = wordsOnLine;
+                                if (lineNums.length === 1) {
+                                    // Single-line phrase: highlight just the phrase
+                                    wordsToHighlight = wordsOnLine;
+                                } else if (idx === 0) {
+                                    // First line: highlight from first word of phrase to end of line
+                                    const allWordsThisLine = wordData.filter(w => w.line_num === ln);
+                                    const startIdx = allWordsThisLine.findIndex(w => w === wordsOnLine[0]);
+                                    wordsToHighlight = allWordsThisLine.slice(startIdx);
+                                } else if (idx === lineNums.length - 1) {
+                                    // Last line: highlight from start of line to last word of phrase
+                                    const allWordsThisLine = wordData.filter(w => w.line_num === ln);
+                                    const endIdx = allWordsThisLine.findIndex(w => w === wordsOnLine[wordsOnLine.length - 1]);
+                                    wordsToHighlight = allWordsThisLine.slice(0, endIdx + 1);
+                                } else {
+                                    // Middle lines: highlight the entire line
+                                    wordsToHighlight = wordData.filter(w => w.line_num === ln);
+                                }
+                                const box = getBoundingBox(wordsToHighlight);
+                                const div = document.createElement('div');
+                                div.className = 'highlight';
+                                div.style.position = 'absolute';
+                                div.style.left = box.x + '%';
+                                div.style.top = box.y + '%';
+                                div.style.width = box.w + '%';
+                                div.style.height = box.h + '%';
+                                div.style.background = color.replace(')', ', 0.15)').replace('hsl', 'hsla');
+                                div.style.borderColor = color;
+                                overlay.appendChild(div);
+                            });
+                        }
                     }
                 });
             }

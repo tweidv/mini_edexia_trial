@@ -136,7 +136,7 @@ Return only a valid Python list of strings, nothing else.
 
 class HighlightExtractionAgent(adk_agents.Agent):
     """
-    Extracts a list of single words from the student work that should be highlighted as evidence for a criterion, based on the evidence+justification text.
+    Extracts a list of phrases (one or more consecutive words) from the student work that should be highlighted as evidence for a criterion, based on the evidence+justification text.
     """
     def __init__(self, name: str = "HighlightExtractionAgent", model: str = "gemini-1.5-flash-latest"):
         super().__init__(name=name)
@@ -144,7 +144,9 @@ class HighlightExtractionAgent(adk_agents.Agent):
 
     def run(self, student_text: str, evidence_justification: str) -> list:
         prompt = f"""
-Given the following student work and the evidence+justification for a criterion, return a Python list of the exact single words from the student work that best serve as evidence for the mark. Only include words that appear in the student work. Return only a Python list of strings, nothing else.
+Given the following student work and the evidence+justification for a criterion, return a Python list of the exact phrases (which may be single words or multiple consecutive words) from the student work that best serve as evidence for the mark. Only include phrases that appear verbatim in the student work. Return only a Python list of strings, nothing else.
+
+A phrase can be a single word or a sequence of consecutive words. For example: ["strong argument", "clear structure", "vivid imagery", "however"]
 
 Student Work:
 ---
