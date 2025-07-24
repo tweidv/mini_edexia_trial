@@ -18,7 +18,7 @@ from script_marker_agent.rubric_formatting_agent import RubricFormattingAgent
 
 # Import the agents and the Phoenix setup function
 from script_marker_agent.ocr_refinement_agent import OcrRefinementAgent, setup_phoenix_tracing
-from script_marker_agent.agent import RubricCriterionExtractorAgent, MainMarkerAgent, MarkExtractionAgent, ReasoningExtractionAgent, EvidenceExtractionAgent
+from script_marker_agent.agent import RubricCriterionExtractorAgent, MainMarkerAgent, MarkExtractionAgent, ReasoningExtractionAgent, EvidenceExtractionAgent, HighlightExtractionAgent
 import threading
 import time
 import shelve
@@ -1550,6 +1550,7 @@ def review_work(submission_id):
         <div class="status-box" id="status-box">
             <span id="status-text">{{ status }}</span>
             <span id="status-spinner" class="spinner" {% if status == 'Complete' %}style="display:none;"{% endif %}></span>
+            <button id="force-remark-btn" style="margin-left:1em;padding:0.4em 1em;font-size:1em;background:#f5f5f5;border:1px solid #bbb;border-radius:5px;cursor:pointer;">Force Remark</button>
         </div>
         <div class="review-layout">
             <div class="review-left">
@@ -1592,61 +1593,87 @@ def review_work(submission_id):
             </div>
         </div>
         <script>
-        // --- Highlighting Logic (reused from Pure OCR) ---
-        function renderHighlights(pageIdx, searchTerm) {
-            const wordData = JSON.parse(document.getElementById('word-data-' + pageIdx).textContent);
-            const img = document.getElementById('ocr-img-' + pageIdx);
-            const overlay = document.getElementById('highlight-overlay-' + pageIdx);
-            overlay.innerHTML = '';
-            if (!searchTerm) return;
-            const imgWidth = img.naturalWidth;
-            const imgHeight = img.naturalHeight;
-            wordData.forEach((word, idx) => {
-                let className = 'highlight';
-                let shouldHighlight = false;
-                if (word.text.includes(searchTerm)) {
-                    className += ' green';
-                    shouldHighlight = true;
-                } else if (word.text.toLowerCase().includes(searchTerm.toLowerCase())) {
-                    className += ' yellow';
-                    shouldHighlight = true;
-                }
-                if (shouldHighlight && word.vertices && word.vertices.length === 4) {
-                    // Scale vertices to overlay size
-                    const x = word.vertices[0].x / imgWidth * 100;
-                    const y = word.vertices[0].y / imgHeight * 100;
-                    const w = (word.vertices[1].x - word.vertices[0].x) / imgWidth * 100;
-                    const h = (word.vertices[2].y - word.vertices[1].y) / imgHeight * 100;
-                    const div = document.createElement('div');
-                    div.className = className;
-                    div.style.position = 'absolute';
-                    div.style.left = x + '%';
-                    div.style.top = y + '%';
-                    div.style.width = w + '%';
-                    div.style.height = h + '%';
-                    overlay.appendChild(div);
-                }
+        // --- Highlighting Logic for Evidence Words ---
+        let currentCriterionIdx = null;
+        let analysis = null;
+        let criteria = {{ criteria|tojson }};
+        let rubricColors = criteria.map((_, idx) => `hsl(${idx * 60}, 60%, 70%)`);
+
+        function clearAllRubricOutlines() {
+            document.querySelectorAll('.rubric-criterion').forEach(el => {
+                el.style.outline = '';
+                el.style.zIndex = '';
             });
         }
-        function setupAllHighlights() {
-            const searchBar = document.getElementById('search-bar');
-            const pageCount = {{ page_images|length }};
-            function updateAll() {
-                for (let i = 0; i < pageCount; i++) {
-                    renderHighlights(i, searchBar.value);
-                }
-            }
-            searchBar.addEventListener('input', updateAll);
-            window.addEventListener('load', updateAll);
+
+        function clearAllHighlights() {
+            document.querySelectorAll('.highlight-overlay').forEach(overlay => {
+                overlay.innerHTML = '';
+            });
         }
-        setupAllHighlights();
+
+        function showHighlightsForCriterion(idx) {
+            clearAllHighlights();
+            if (!analysis) return;
+            let highlights = analysis[criteria[idx]] && analysis[criteria[idx]].highlights ? analysis[criteria[idx]].highlights : [];
+            let color = rubricColors[idx];
+            // For each page
+            for (let pageIdx = 0; pageIdx < {{ page_images|length }}; pageIdx++) {
+                const wordData = JSON.parse(document.getElementById('word-data-' + pageIdx).textContent);
+                const img = document.getElementById('ocr-img-' + pageIdx);
+                const overlay = document.getElementById('highlight-overlay-' + pageIdx);
+                overlay.innerHTML = '';
+                const imgWidth = img.naturalWidth;
+                const imgHeight = img.naturalHeight;
+                wordData.forEach((word, widx) => {
+                    if (highlights.includes(word.text) && word.vertices && word.vertices.length === 4) {
+                        const x = word.vertices[0].x / imgWidth * 100;
+                        const y = word.vertices[0].y / imgHeight * 100;
+                        const w = (word.vertices[1].x - word.vertices[0].x) / imgWidth * 100;
+                        const h = (word.vertices[2].y - word.vertices[1].y) / imgHeight * 100;
+                        const div = document.createElement('div');
+                        div.className = 'highlight';
+                        div.style.position = 'absolute';
+                        div.style.left = x + '%';
+                        div.style.top = y + '%';
+                        div.style.width = w + '%';
+                        div.style.height = h + '%';
+                        div.style.background = color.replace(')', ', 0.15)').replace('hsl', 'hsla');
+                        div.style.borderColor = color;
+                        overlay.appendChild(div);
+                    }
+                });
+            }
+        }
+
+        function selectCriterion(idx) {
+            clearAllRubricOutlines();
+            clearAllHighlights();
+            // Outline the selected rubric
+            let rubricDivs = document.querySelectorAll('.rubric-criterion');
+            rubricDivs[idx].style.outline = `3px solid ${rubricColors[idx]}`;
+            rubricDivs[idx].style.zIndex = 2;
+            showHighlightsForCriterion(idx);
+            currentCriterionIdx = idx;
+        }
+
+        // Add click listeners to rubric containers
+        document.addEventListener('DOMContentLoaded', function() {
+            let rubricDivs = document.querySelectorAll('.rubric-criterion');
+            rubricDivs.forEach((div, idx) => {
+                div.addEventListener('click', function() {
+                    selectCriterion(idx);
+                });
+            });
+        });
+
         // --- Marking/Analysis Update Logic ---
         let statusText = document.getElementById('status-text');
         let statusSpinner = document.getElementById('status-spinner');
         let rubricRight = document.getElementById('rubric-right');
         let submissionId = {{ submission.id }};
-        let criteria = {{ criteria|tojson }};
-        function updateRubricContainers(analysis) {
+        function updateRubricContainers(newAnalysis) {
+            analysis = newAnalysis;
             criteria.forEach(function(criterion, idx) {
                 let mark = analysis[criterion] && analysis[criterion]['suggested_mark'] !== undefined && analysis[criterion]['suggested_mark'] !== null ? analysis[criterion]['suggested_mark'] : '…';
                 let reasoning = analysis[criterion] && analysis[criterion]['reasoning'] ? analysis[criterion]['reasoning'] : '(not yet analyzed)';
@@ -1655,10 +1682,17 @@ def review_work(submission_id):
                 document.getElementById('reasoning-' + idx).textContent = reasoning;
                 document.getElementById('evidence-' + idx).textContent = evidence;
             });
+            // If a criterion is already selected, refresh its highlights
+            if (currentCriterionIdx !== null) {
+                showHighlightsForCriterion(currentCriterionIdx);
+            }
         }
-        function runMarkingOnce() {
+        function runMarkingOnce(force=false) {
             statusText.textContent = 'Processing...';
-            fetch('/api/mark_work/' + submissionId)
+            statusSpinner.style.display = '';
+            let url = '/api/mark_work/' + submissionId;
+            if (force) url += '?force=1';
+            fetch(url)
                 .then(response => response.json())
                 .then(data => {
                     if (data.status === 'complete') {
@@ -1696,6 +1730,9 @@ def review_work(submission_id):
         }
         // Run marking once on page load
         runMarkingOnce();
+        document.getElementById('force-remark-btn').addEventListener('click', function() {
+            runMarkingOnce(true);
+        });
         </script>
     </body>
     </html>
@@ -1765,16 +1802,17 @@ def api_mark_work(submission_id):
         # Synchronous marking: run if not already done
         key = get_marking_result_key(submission_id)
         with shelve.open(MARKING_RESULTS_DB) as db:
-            if key in db and all(db[key][c]["status"] == "complete" for c in criteria):
+            if not request.args.get('force', '0') == '1' and key in db and all(db[key][c]["status"] == "complete" for c in criteria):
                 print('[DEBUG] Using cached marking result.')
                 result = db[key]
             else:
-                print('[DEBUG] Running marking agents...')
-                result = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing"} for c in criteria}
+                print('[DEBUG] Running marking agents... (force_remark=' + str(request.args.get('force', '0') == '1') + ')')
+                result = {c: {"suggested_mark": None, "reasoning": None, "evidence_justification": None, "status": "processing", "highlights": []} for c in criteria}
                 db[key] = result
                 main_agent = MainMarkerAgent()
                 main_output = main_agent.run(rubric.content, refined_text)
                 print(f'[DEBUG] Main marker output:\n{main_output}\n')
+                highlight_agent = HighlightExtractionAgent()
                 for c in criteria:
                     mark_agent = MarkExtractionAgent()
                     reasoning_agent = ReasoningExtractionAgent()
@@ -1785,10 +1823,13 @@ def api_mark_work(submission_id):
                     print(f"[DEBUG] Reasoning for '{c}': {reasoning}")
                     evidence = evidence_agent.run(main_output, c)
                     print(f"[DEBUG] Evidence for '{c}': {evidence}")
+                    highlights = highlight_agent.run(refined_text, evidence)
+                    print(f"[DEBUG] Highlights for '{c}': {highlights}")
                     result[c] = {
                         "suggested_mark": mark,
                         "reasoning": reasoning,
                         "evidence_justification": evidence,
+                        "highlights": highlights,
                         "status": "complete"
                     }
                 db[key] = result

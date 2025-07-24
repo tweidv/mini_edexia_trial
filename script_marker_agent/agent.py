@@ -133,3 +133,40 @@ Return only a valid Python list of strings, nothing else.
         except Exception as e:
             print(f"An error occurred during criterion extraction: {e}")
             return []
+
+class HighlightExtractionAgent(adk_agents.Agent):
+    """
+    Extracts a list of single words from the student work that should be highlighted as evidence for a criterion, based on the evidence+justification text.
+    """
+    def __init__(self, name: str = "HighlightExtractionAgent", model: str = "gemini-1.5-flash-latest"):
+        super().__init__(name=name)
+        self._llm = genai.GenerativeModel(model)
+
+    def run(self, student_text: str, evidence_justification: str) -> list:
+        prompt = f"""
+Given the following student work and the evidence+justification for a criterion, return a Python list of the exact single words from the student work that best serve as evidence for the mark. Only include words that appear in the student work. Return only a Python list of strings, nothing else.
+
+Student Work:
+---
+{student_text}
+---
+
+Evidence + Justification:
+---
+{evidence_justification}
+---
+"""
+        response = self._llm.generate_content(prompt)
+        text = response.text.strip()
+        # Try to extract a Python list from the response
+        try:
+            start = text.find('[')
+            end = text.rfind(']')
+            if start != -1 and end != -1:
+                list_str = text[start:end+1]
+                return json.loads(list_str.replace("'", '"'))
+            else:
+                raise ValueError("No Python list found in LLM response.")
+        except Exception as e:
+            print(f"[HighlightExtractionAgent] Error parsing LLM response: {e}\nRaw response: {text}")
+            return []
