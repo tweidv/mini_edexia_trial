@@ -1802,7 +1802,7 @@ def api_mark_work(submission_id):
         # Synchronous marking: run if not already done
         key = get_marking_result_key(submission_id)
         with shelve.open(MARKING_RESULTS_DB) as db:
-            if not request.args.get('force', '0') == '1' and key in db and all(db[key][c]["status"] == "complete" for c in criteria):
+            if not request.args.get('force', '0') == '1' and key in db and all(c in db[key] and db[key][c].get("status") == "complete" for c in criteria):
                 print('[DEBUG] Using cached marking result.')
                 result = db[key]
             else:
