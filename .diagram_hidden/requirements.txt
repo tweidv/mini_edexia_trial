@@ -1,7 +1,0 @@
-opencv-python
-numpy
-matplotlib
-Pillow
-google-cloud-vision
-google-generativeai
-protobuf 

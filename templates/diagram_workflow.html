@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Diagram Workflow Tool</title>
+</head>
+<body>
+    <h1>Diagram Workflow Tool</h1>
+    <a href="/">&larr; Back to Home</a>
+    <form method="post" enctype="multipart/form-data">
+        <label for="image">Upload diagram image:</label>
+        <input type="file" name="image" id="image" required><br><br>
+        <label for="question">Diagram question/instructions:</label><br>
+        <textarea name="question" id="question" rows="4" cols="50" required></textarea><br><br>
+        <button type="submit">Run Workflow</button>
+    </form>
+    {% if error %}
+        <p style="color:red;">{{ error }}</p>
+    {% endif %}
+    {% if result %}
+        <h2>Results</h2>
+        <h3>Qualitative Assessment</h3>
+        <p>{{ result.qualitative_assessment }}</p>
+        <h4>Similarities</h4>
+        <ul>
+        {% for s in result.similarities %}
+            <li>{{ s }}</li>
+        {% endfor %}
+        </ul>
+        <h4>Differences</h4>
+        <ul>
+        {% for d in result.differences %}
+            <li>{{ d }}</li>
+        {% endfor %}
+        </ul>
+        <h4>Suggestions for Improvement</h4>
+        <ul>
+        {% for sug in result.suggestions %}
+            <li>{{ sug }}</li>
+        {% endfor %}
+        </ul>
+        <h3>Images</h3>
+        <p>Ideal Diagram:</p>
+        <img src="/{{ result.ideal_diagram_img }}" alt="Ideal Diagram" style="max-width:400px;"><br>
+        <p>Overlay:</p>
+        <img src="/{{ result.overlay_img }}" alt="Overlay Diagram" style="max-width:400px;"><br>
+        <p>Student Detected Points:</p>
+        <img src="/{{ result.student_detected_points_img }}" alt="Student Points" style="max-width:400px;"><br>
+        <p>Student Detected Lines:</p>
+        <img src="/{{ result.student_detected_lines_img }}" alt="Student Lines" style="max-width:400px;"><br>
+        <p>Student Detected Circles:</p>
+        <img src="/{{ result.student_detected_circles_img }}" alt="Student Circles" style="max-width:400px;"><br>
+        <h3>Raw Data</h3>
+        <pre>{{ result | tojson(indent=2) }}</pre>
+    {% endif %}
+</body>
+</html> 

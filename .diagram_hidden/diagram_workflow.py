@@ -478,7 +478,7 @@ def get_detailed_drawing_plan_llm(question_text, student_refined_points):
     Based on the following math problem question and the detected anchor points, generate a detailed drawing plan.
     The plan should specify:
     1.  `derived_point_calculations`: A list of objects, each describing how to calculate a new point.
-        - For reflection: `{{'point_label': 'D', 'type': 'reflection', 'source_point': 'B', 'over_line': ['A', 'C']}}`
+        - For reflection: `{{'point_label': 'D', 'type': 'reflection', 'source_point': 'B', 'over_line': ['A', 'C']}}` (Note: 'over_line' must be provided for reflections)
         - For midpoint: `{{'point_label': 'M', 'type': 'midpoint', 'points': ['A', 'C']}}`
     2.  `lines_to_draw`: A list of lists, where each inner list contains two point labels (e.g., `['A', 'B']`). This should cover all primary lines.
     3.  `circles_to_draw`: A list of objects, each describing a circle.
@@ -549,7 +549,7 @@ def get_detailed_drawing_plan_llm(question_text, student_refined_points):
         # Fallback to a default drawing plan on error
         fallback_plan = {
             "derived_point_calculations": [
-                {"point_label": "D", "type": "reflection", "source_point": "B", "over_line": ["A", "C"]}
+                {"point_label": "D", "type": "reflection", "source_point": "B", "over_line": ["A", "C"]} # Added over_line to fallback
             ],
             "lines_to_draw": [
                 ["A", "B"], ["B", "C"], ["A", "C"], ["A", "D"], ["C", "D"]
@@ -564,7 +564,7 @@ def get_detailed_drawing_plan_llm(question_text, student_refined_points):
 
 
 # --- Step 4: Construct the Ideal Diagram Image (Programmatic Drawing) ---
-def construct_ideal_diagram(student_refined_points, drawing_plan, img_shape):
+def construct_ideal_diagram(student_refined_points, drawing_plan, img_shape, easiest_anchor_points):
     """
     Programmatically constructs an ideal, complete diagram image using Pillow,
     driven by a detailed drawing plan from the LLM.
@@ -573,10 +573,16 @@ def construct_ideal_diagram(student_refined_points, drawing_plan, img_shape):
     print("--- Step 4: Constructing the ideal diagram using Pillow (based on drawing plan) ---")
     sys.stdout.flush()
 
-    # Start with student's anchor points
-    ideal_coords_for_comparison = {
-        label: coords for label, coords in student_refined_points.items()
-    }
+    # Initialize ideal_coords_for_comparison with ONLY the anchor points from the student's diagram
+    ideal_coords_for_comparison = {}
+    for label in easiest_anchor_points:
+        if label in student_refined_points:
+            ideal_coords_for_comparison[label] = student_refined_points[label]
+        else:
+            print(f"Warning: Anchor point '{label}' not found in student_refined_points. Cannot construct ideal diagram accurately.")
+            sys.stdout.flush()
+            # Depending on severity, you might want to raise an error or return an empty dict here.
+            # For now, we'll continue, but the diagram might be incomplete.
 
     img_width, img_height = img_shape[1], img_shape[0]
     ideal_img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
@@ -636,6 +642,9 @@ def construct_ideal_diagram(student_refined_points, drawing_plan, img_shape):
                 else:
                     print(f"Warning: Missing or invalid coordinates for reflection calculation for point '{point_label}'.")
                     sys.stdout.flush()
+            else:
+                print(f"Warning: Reflection calculation for point '{point_label}' is missing 'source_point' or 'over_line' information. Skipping calculation.")
+                sys.stdout.flush()
         elif calc_type == "midpoint":
             midpoint_points_labels = calc.get('points')
             if midpoint_points_labels and len(midpoint_points_labels) == 2:
@@ -973,47 +982,49 @@ def judge_student_diagram(student_refined_points, ideal_coords_for_comparison, h
     sys.stdout.flush()
 
     # Quantitative Comparison: Compare point distances
-    aggregate_distance = 0
-    num_compared_points = 0
-    point_comparison_details = {}
+    aggregate_distance_anchors = 0
+    num_compared_anchors = 0
+    aggregate_distance_derived = 0
+    num_compared_derived = 0
 
-    # ideal_coords_for_comparison are already in the pixel space of the student's diagram,
-    # so no further scaling/offset is needed for direct comparison.
+    point_comparison_details = {}
+    anchor_labels = ['A', 'B', 'C'] # Define anchor points
+
     for label, ideal_point_pixel in ideal_coords_for_comparison.items():
         if label in student_refined_points:
             student_point = student_refined_points[label]
-            # Ensure points are valid before comparison
             if student_point is not None and not np.isnan(student_point).any() and \
                ideal_point_pixel is not None and not np.isnan(ideal_point_pixel).any():
                 distance = np.linalg.norm(np.array(student_point) - np.array(ideal_point_pixel))
-                aggregate_distance += distance
-                num_compared_points += 1
                 point_comparison_details[label] = {
                     'student_coords': student_point.tolist(),
-                    'ideal_coords_completed': ideal_point_pixel.tolist(), # Renamed for clarity
+                    'ideal_coords_completed': ideal_point_pixel.tolist(),
                     'distance': distance
                 }
+                if label in anchor_labels:
+                    aggregate_distance_anchors += distance
+                    num_compared_anchors += 1
+                else:
+                    aggregate_distance_derived += distance
+                    num_compared_derived += 1
             else:
                 print(f"Warning: Skipping quantitative comparison for label '{label}' due to invalid coordinates (student: {student_point}, ideal: {ideal_point_pixel}).")
                 sys.stdout.flush()
         else:
-            # This case should ideally not happen for A, B, C as they are input anchors.
-            # It might happen for D if OCR failed to detect 'D' but it was calculated.
             print(f"Warning: Label '{label}' from ideal diagram (completed) not found in student's detected points for quantitative comparison.")
             sys.stdout.flush()
 
-    if num_compared_points > 0:
-        average_distance = aggregate_distance / num_compared_points
-        print(f"Quantitative Comparison: Average point distance = {average_distance:.2f} pixels.")
-        print("Point-by-point comparison details:")
-        sys.stdout.flush()
-        for label, details in point_comparison_details.items():
-            print(f"  {label}: Student({details['student_coords'][0]:.0f}, {details['student_coords'][1]:.0f}), "
-                  f"Ideal_Completed({details['ideal_coords_completed'][0]:.0f}, {details['ideal_coords_completed'][1]:.0f}), "
-                  f"Distance={details['distance']:.2f}")
-            sys.stdout.flush()
-    else:
-        print("No common points to compare quantitatively or all points had invalid coordinates.")
+    average_distance_anchors = aggregate_distance_anchors / num_compared_anchors if num_compared_anchors > 0 else 0
+    average_distance_derived = aggregate_distance_derived / num_compared_derived if num_compared_derived > 0 else 0
+
+    print(f"Quantitative Comparison: Average anchor point distance = {average_distance_anchors:.2f} pixels.")
+    print(f"Quantitative Comparison: Average derived point distance = {average_distance_derived:.2f} pixels.")
+    print("Point-by-point comparison details:")
+    sys.stdout.flush()
+    for label, details in point_comparison_details.items():
+        print(f"  {label}: Student({details['student_coords'][0]:.0f}, {details['student_coords'][1]:.0f}), "
+              f"Ideal_Completed({details['ideal_coords_completed'][0]:.0f}, {details['ideal_coords_completed'][1]:.0f}), "
+              f"Distance={details['distance']:.2f}")
         sys.stdout.flush()
 
     # Qualitative Comparison (Multi-modal LLM)
@@ -1041,8 +1052,22 @@ def judge_student_diagram(student_refined_points, ideal_coords_for_comparison, h
         if hand_drawn_image_data is None or ideal_diagram_image_data is None:
             raise FileNotFoundError("One or both diagram images for LLM comparison were not found.")
 
+        prompt_text = f"""
+        Compare these two diagrams. The first image is a hand-drawn diagram by a student, and the second image is the ideal, programmatically generated diagram based on the student's initial points.
+
+        Here are some quantitative metrics for point accuracy:
+        - Average error distance for primary anchor points (A, B, C): {average_distance_anchors:.2f} pixels.
+        - Average error distance for derived points (like D, M, etc.): {average_distance_derived:.2f} pixels.
+
+        Provide a structured assessment as a JSON object with the following keys:
+        'overall_assessment': string (incorporate the quantitative error data into this assessment)
+        'similarities': list of strings
+        'differences': list of strings
+        'suggestions_for_improvement': list of strings (provide specific, actionable advice based on both visual and quantitative data)
+        """
+
         prompt_parts = [
-            {"text": "Compare these two diagrams. The first image is a hand-drawn diagram by a student, and the second image is the ideal, programmatically generated diagram based on the student's initial points. Provide a structured assessment as a JSON object with the following keys:\n'overall_assessment': string\n'similarities': list of strings\n'differences': list of strings\n'suggestions_for_improvement': list of strings"},
+            {"text": prompt_text},
             hand_drawn_image_data,
             ideal_diagram_image_data
         ]
@@ -1074,7 +1099,7 @@ def judge_student_diagram(student_refined_points, ideal_coords_for_comparison, h
         for d in llm_response.get('differences', []):
             print(f"- {d}")
         print("Suggestions for Improvement:")
-        for s in llm_response.get('suggestions_for_improvement', []): # Corrected key from 'suggestions' to 'suggestions_for_improvement'
+        for s in llm_response.get('suggestions_for_improvement', []):
             print(f"- {s}")
         sys.stdout.flush()
 
@@ -1241,8 +1266,8 @@ def main_workflow(image_path, question_text):
     sys.stdout.flush()
 
     # Step 4: Construct the Ideal Diagram Image (Programmatic Drawing)
-    # Now pass the detailed drawing_plan to construct_ideal_diagram
-    ideal_coords_for_comparison, ideal_diagram_img_path = construct_ideal_diagram(student_refined_points, drawing_plan, hand_drawn_img.shape)
+    # Now pass the detailed drawing_plan and easiest_anchor_points to construct_ideal_diagram
+    ideal_coords_for_comparison, ideal_diagram_img_path = construct_ideal_diagram(student_refined_points, drawing_plan, hand_drawn_img.shape, easiest_anchor_points)
     print("DEBUG: After construct_ideal_diagram.")
     sys.stdout.flush()
     if ideal_diagram_img_path == "ideal_diagram_error.png" or ideal_diagram_img_path == "ideal_diagram_error_save_failed.png":
