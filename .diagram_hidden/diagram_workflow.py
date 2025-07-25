@@ -375,7 +375,8 @@ def understand_diagram_structure_llm(question_text):
         drawing_instructions = [
             "Draw point A.", "Draw point C.", "Draw point B such that triangle ABC is isosceles with AB = BC.",
             "Draw line segment AC.", "Draw line segment AB.", "Draw line segment BC.",
-            "Find the reflection D of point B over line AC.", "Draw line segment AD.", "Draw line segment CD."
+            "Find the reflection D of point B over line AC.", "Draw line segment AD.", "Draw line segment CD.",
+            "Draw the circumcircle of triangle ADC." # Added for fallback consistency
         ]
         num_determining_points = 3
         easiest_anchor_points = ['A', 'C', 'B']
@@ -421,116 +422,291 @@ def reflect_point_over_line(point, line_p1, line_p2):
 
     return np.array([x_prime, y_prime])
 
+# --- Helper function to calculate circumcenter and circumradius of a triangle ---
+def get_circumcircle(p1, p2, p3):
+    """
+    Calculates the circumcenter (cx, cy) and circumradius (r) of a triangle defined by three points.
+    Returns (cx, cy, r) or (None, None, None) if points are collinear.
+    """
+    # Convert to numpy arrays for easier calculations
+    p1 = np.array(p1)
+    p2 = np.array(p2)
+    p3 = np.array(p3)
+
+    # Check for collinearity
+    # Area of triangle using determinant: 0.5 * |x1(y2-y3) + x2(y3-y1) + x3(y1-y2)|
+    area = 0.5 * abs(p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1]))
+    if area < 1e-6: # Treat very small area as collinear
+        print("Warning: Points are collinear, cannot form a circumcircle.")
+        sys.stdout.flush()
+        return None, None, None
+
+    D = 2 * (p1[0] * (p2[1] - p3[1]) + p2[0] * (p3[1] - p1[1]) + p3[0] * (p1[1] - p2[1]))
+    
+    # Check for division by zero (collinear points)
+    if D == 0:
+        print("Warning: Division by zero in circumcircle calculation, points are collinear.")
+        sys.stdout.flush()
+        return None, None, None
+
+    sq1 = np.sum(p1**2)
+    sq2 = np.sum(p2**2)
+    sq3 = np.sum(p3**2)
+
+    cx = (sq1 * (p2[1] - p3[1]) + sq2 * (p3[1] - p1[1]) + sq3 * (p1[1] - p2[1])) / D
+    cy = (sq1 * (p3[0] - p2[0]) + sq2 * (p1[0] - p3[0]) + sq3 * (p2[0] - p1[0])) / D
+
+    circumcenter = np.array([cx, cy])
+    circumradius = np.linalg.norm(p1 - circumcenter) # Distance from center to any vertex
+
+    return cx, cy, circumradius
+
+# --- New Intermediary LLM Agent: Get Detailed Drawing Plan ---
+def get_detailed_drawing_plan_llm(question_text, student_refined_points):
+    """
+    Uses Gemini LLM to process the question and student's anchor points
+    into a detailed, actionable drawing plan with geometric calculations.
+    """
+    print(f"--- Intermediary LLM Agent: Getting detailed drawing plan for: '{question_text}' ---")
+    sys.stdout.flush()
+    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    # Convert numpy arrays in student_refined_points to lists for JSON serialization
+    serializable_refined_points = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in student_refined_points.items()}
+
+    prompt = f"""
+    Based on the following math problem question and the detected anchor points, generate a detailed drawing plan.
+    The plan should specify:
+    1.  `derived_point_calculations`: A list of objects, each describing how to calculate a new point.
+        - For reflection: `{{'point_label': 'D', 'type': 'reflection', 'source_point': 'B', 'over_line': ['A', 'C']}}`
+        - For midpoint: `{{'point_label': 'M', 'type': 'midpoint', 'points': ['A', 'C']}}`
+    2.  `lines_to_draw`: A list of lists, where each inner list contains two point labels (e.g., `['A', 'B']`). This should cover all primary lines.
+    3.  `circles_to_draw`: A list of objects, each describing a circle.
+        - For circumcircle: `{{'type': 'circumcircle', 'points': ['A', 'D', 'C']}}`
+
+    Ensure all points referenced in 'lines_to_draw' and 'circles_to_draw' are either in the 'Anchor Points' or explicitly defined in 'derived_point_calculations'.
+
+    Question: '{question_text}'
+    Anchor Points (from OCR and image processing): {serializable_refined_points}
+
+    Return as JSON:
+    ```json
+    {{
+      "derived_point_calculations": [],
+      "lines_to_draw": [],
+      "circles_to_draw": []
+    }}
+    ```
+    """
+
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "response_mime_type": "application/json",
+                "response_schema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "derived_point_calculations": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "point_label": {"type": "STRING"},
+                                    "type": {"type": "STRING"},
+                                    "source_point": {"type": "STRING", "nullable": True},
+                                    "over_line": {"type": "ARRAY", "items": {"type": "STRING"}, "nullable": True},
+                                    "points": {"type": "ARRAY", "items": {"type": "STRING"}, "nullable": True}
+                                },
+                                "required": ["point_label", "type"]
+                            }
+                        },
+                        "lines_to_draw": {"type": "ARRAY", "items": {"type": "ARRAY", "items": {"type": "STRING"}}},
+                        "circles_to_draw": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "type": {"type": "STRING"},
+                                    "points": {"type": "ARRAY", "items": {"type": "STRING"}}
+                                },
+                                "required": ["type", "points"]
+                            }
+                        }
+                    },
+                    "required": ["derived_point_calculations", "lines_to_draw", "circles_to_draw"]
+                }
+            }
+        )
+        drawing_plan = json.loads(response.text)
+        print(f"Detailed Drawing Plan from LLM: {drawing_plan}")
+        sys.stdout.flush()
+        return drawing_plan
+
+    except Exception as e:
+        print(f"Error during intermediary LLM call for drawing plan: {e}")
+        sys.stdout.flush()
+        # Fallback to a default drawing plan on error
+        fallback_plan = {
+            "derived_point_calculations": [
+                {"point_label": "D", "type": "reflection", "source_point": "B", "over_line": ["A", "C"]}
+            ],
+            "lines_to_draw": [
+                ["A", "B"], ["B", "C"], ["A", "C"], ["A", "D"], ["C", "D"]
+            ],
+            "circles_to_draw": [
+                {"type": "circumcircle", "points": ["A", "D", "C"]}
+            ]
+        }
+        print("Using fallback drawing plan due to error.")
+        sys.stdout.flush()
+        return fallback_plan
+
 
 # --- Step 4: Construct the Ideal Diagram Image (Programmatic Drawing) ---
-def construct_ideal_diagram(student_refined_points, drawing_instructions, img_shape):
+def construct_ideal_diagram(student_refined_points, drawing_plan, img_shape):
     """
-    Programmatically constructs an ideal, complete diagram image using Pillow.
-    This "ideal" diagram is a precise completion of the student's drawing,
-    using the student's anchor points (A, B, C) to derive the position of D.
+    Programmatically constructs an ideal, complete diagram image using Pillow,
+    driven by a detailed drawing plan from the LLM.
     The output image will be transparent with red lines/shapes and labels.
     """
-    print("--- Step 4: Constructing the ideal diagram using Pillow (based on student's points) ---")
+    print("--- Step 4: Constructing the ideal diagram using Pillow (based on drawing plan) ---")
     sys.stdout.flush()
 
-    # Get the student's detected pixel coordinates for A, B, C
-    # These are the "anchor points" for this ideal diagram
-    A_student_pixel = student_refined_points.get('A')
-    B_student_pixel = student_refined_points.get('B')
-    C_student_pixel = student_refined_points.get('C')
-
-    # Ensure all crucial anchor points are present. D will be calculated.
-    if A_student_pixel is None or B_student_pixel is None or C_student_pixel is None:
-        missing_points = [p for p, val in {'A': A_student_pixel, 'B': B_student_pixel, 'C': C_student_pixel}.items() if val is None]
-        print(f"Error: Missing crucial anchor points {missing_points} from student's diagram. Cannot construct ideal diagram.")
-        sys.stdout.flush()
-        # Return empty data and a specific error path
-        return {}, "ideal_diagram_error.png"
-
-    # Calculate the ideal position of D (reflection of B over AC) using student's pixel coordinates
-    # This is the core of "finishing off their diagram for them"
-    D_ideal_pixel = reflect_point_over_line(B_student_pixel, A_student_pixel, C_student_pixel)
-
-    # The "ideal" coordinates for comparison are now these pixel coordinates
+    # Start with student's anchor points
     ideal_coords_for_comparison = {
-        'A': A_student_pixel,
-        'B': B_student_pixel,
-        'C': C_student_pixel,
-        'D': D_ideal_pixel
+        label: coords for label, coords in student_refined_points.items()
     }
 
-    print(f"Student's anchor points (pixel): {A_student_pixel}, {B_student_pixel}, {C_student_pixel}")
-    print(f"Calculated ideal D point (pixel): {D_ideal_pixel}")
-    sys.stdout.flush()
-
-    img_width, img_height = img_shape[1], img_shape[0] # OpenCV returns (height, width, channels)
-
-    # Create a new transparent image using Pillow
-    ideal_img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0)) # Transparent background
+    img_width, img_height = img_shape[1], img_shape[0]
+    ideal_img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(ideal_img)
 
-    # Define colors and line width
-    line_color_solid = (255, 0, 0, 255) # Red, fully opaque
-    point_color = (255, 0, 0, 255) # Red, fully opaque
-    text_color = (255, 0, 0, 255) # Red, fully opaque
-    line_width = 4 # To cover "within 2 pixels distance" (2 pixels on each side of the center line)
-    point_radius = 8 # Increased point radius for better visibility
-    text_offset_x = 15 # Increased offset for label placement
+    line_color_solid = (255, 0, 0, 255)
+    point_color = (255, 0, 0, 255)
+    text_color = (255, 0, 0, 255)
+    line_width = 4
+    point_radius = 8
+    text_offset_x = 15
     text_offset_y = 15
 
-    # Try to load a default font, or use Pillow's default if not found
     font = None
     font_paths = [
-        "C:/Users/tweid/Projects/mini_edexia_trial/.venv/Lib/site-packages/Pillow/Libs/arial.ttf", # Common Windows path
-        "C:/Windows/Fonts/arial.ttf", # Common Windows path
-        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf", # Common Linux path
-        "/Library/Fonts/Arial.ttf", # Common macOS path
-        "arial.ttf" # Generic lookup
+        "C:/Users/tweid/Projects/mini_edexia_trial/.venv/Lib/site-packages/Pillow/Libs/arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "arial.ttf"
     ]
-    
     for path in font_paths:
         try:
-            font = ImageFont.truetype(path, 40) # Adjusted font size for better visibility
+            font = ImageFont.truetype(path, 40)
             print(f"DEBUG: Loaded font: {font.font.family}, size {font.size} from {path}")
             sys.stdout.flush()
             break
         except IOError:
-            continue # Try next path
+            continue
         except Exception as e:
             print(f"ERROR: Unexpected error loading font from {path}: {e}")
             sys.stdout.flush()
             continue
-    
     if font is None:
         font = ImageFont.load_default()
         print(f"Warning: No specific Arial font found, using default Pillow font: {font.font.family}, size {font.size}.")
         sys.stdout.flush()
 
+    # 1. Calculate derived points based on the drawing plan
+    for calc in drawing_plan.get("derived_point_calculations", []):
+        point_label = calc['point_label']
+        calc_type = calc['type']
 
-    # Draw triangle ABC (solid lines) using student's points
-    draw.line([tuple(A_student_pixel), tuple(B_student_pixel)], fill=line_color_solid, width=line_width) # AB
-    draw.line([tuple(B_student_pixel), tuple(C_student_pixel)], fill=line_color_solid, width=line_width) # BC
-    draw.line([tuple(C_student_pixel), tuple(A_student_pixel)], fill=line_color_solid, width=line_width) # AC
+        if calc_type == "reflection":
+            source_point_label = calc.get('source_point')
+            over_line_labels = calc.get('over_line')
+            if source_point_label and over_line_labels and len(over_line_labels) == 2:
+                source_coords = ideal_coords_for_comparison.get(source_point_label)
+                line_p1_coords = ideal_coords_for_comparison.get(over_line_labels[0])
+                line_p2_coords = ideal_coords_for_comparison.get(over_line_labels[1])
 
-    # Draw triangle ADC (using the calculated ideal D)
-    draw.line([tuple(D_ideal_pixel), tuple(ideal_coords_for_comparison['C'])], fill=line_color_solid, width=line_width) # DC
-    draw.line([tuple(A_student_pixel), tuple(D_ideal_pixel)], fill=line_color_solid, width=line_width) # AD
+                if all(c is not None and not np.isnan(c).any() for c in [source_coords, line_p1_coords, line_p2_coords]):
+                    derived_coords = reflect_point_over_line(source_coords, line_p1_coords, line_p2_coords)
+                    ideal_coords_for_comparison[point_label] = derived_coords
+                    print(f"DEBUG: Calculated derived point '{point_label}' (reflection): {derived_coords.tolist()}")
+                    sys.stdout.flush()
+                else:
+                    print(f"Warning: Missing or invalid coordinates for reflection calculation for point '{point_label}'.")
+                    sys.stdout.flush()
+        elif calc_type == "midpoint":
+            midpoint_points_labels = calc.get('points')
+            if midpoint_points_labels and len(midpoint_points_labels) == 2:
+                p1_coords = ideal_coords_for_comparison.get(midpoint_points_labels[0])
+                p2_coords = ideal_coords_for_comparison.get(midpoint_points_labels[1])
+                if all(c is not None and not np.isnan(c).any() for c in [p1_coords, p2_coords]):
+                    derived_coords = np.array([(p1_coords[0] + p2_coords[0]) / 2, (p1_coords[1] + p2_coords[1]) / 2])
+                    ideal_coords_for_comparison[point_label] = derived_coords
+                    print(f"DEBUG: Calculated derived point '{point_label}' (midpoint): {derived_coords.tolist()}")
+                    sys.stdout.flush()
+                else:
+                    print(f"Warning: Missing or invalid coordinates for midpoint calculation for point '{point_label}'.")
+                    sys.stdout.flush()
+        # Add more derived point types here if needed
 
+    # 2. Draw lines based on the drawing plan
+    for segment_labels in drawing_plan.get("lines_to_draw", []):
+        if len(segment_labels) == 2:
+            p1_label, p2_label = segment_labels
+            p1_coords = ideal_coords_for_comparison.get(p1_label)
+            p2_coords = ideal_coords_for_comparison.get(p2_label)
+            
+            if p1_coords is not None and p2_coords is not None and not np.isnan(p1_coords).any() and not np.isnan(p2_coords).any():
+                draw.line([tuple(p1_coords), tuple(p2_coords)], fill=line_color_solid, width=line_width)
+                print(f"DEBUG: Drawn line segment {p1_label}{p2_label} based on LLM's drawing plan.")
+                sys.stdout.flush()
+            else:
+                print(f"Warning: Missing or invalid coordinates for line segment {p1_label}{p2_label}. Skipping line drawing.")
+                sys.stdout.flush()
+
+    # 3. Draw circles based on the drawing plan
+    for circle_info in drawing_plan.get("circles_to_draw", []):
+        circle_type = circle_info['type']
+        if circle_type == "circumcircle":
+            points_labels = circle_info.get('points')
+            if points_labels and len(points_labels) == 3:
+                p1_coords = ideal_coords_for_comparison.get(points_labels[0])
+                p2_coords = ideal_coords_for_comparison.get(points_labels[1])
+                p3_coords = ideal_coords_for_comparison.get(points_labels[2])
+
+                if all(c is not None and not np.isnan(c).any() for c in [p1_coords, p2_coords, p3_coords]):
+                    cx, cy, r = get_circumcircle(p1_coords, p2_coords, p3_coords)
+                    if cx is not None and cy is not None and r is not None:
+                        print(f"DEBUG: Drawing circumcircle for {points_labels} at center ({cx:.2f}, {cy:.2f}) with radius {r:.2f}.")
+                        sys.stdout.flush()
+                        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=line_color_solid, width=line_width)
+                    else:
+                        print(f"Warning: Could not calculate circumcircle for {points_labels} (points might be collinear or invalid).")
+                        sys.stdout.flush()
+                else:
+                    print(f"Warning: Missing or invalid coordinates for circumcircle {points_labels}.")
+                    sys.stdout.flush()
+        # Add more circle types here if needed
 
     # Draw points (small circles) and add labels for all points in the ideal diagram
     print("DEBUG: Starting drawing loop for labels on ideal diagram.")
     sys.stdout.flush()
     for label, coords_pixel in ideal_coords_for_comparison.items():
-        x, y = coords_pixel
-        print(f"DEBUG: Drawing point and label for '{label}' at ({x:.2f}, {y:.2f}).")
-        sys.stdout.flush()
-        draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), fill=point_color)
-        # Add label slightly offset from the point
-        draw.text((x + text_offset_x, y + text_offset_y), label, font=font, fill=text_color)
-        sys.stdout.flush() # Flush after each label drawing
+        if coords_pixel is not None and not np.isnan(coords_pixel).any():
+            x, y = coords_pixel
+            print(f"DEBUG: Drawing point and label for '{label}' at ({x:.2f}, {y:.2f}).")
+            sys.stdout.flush()
+            draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), fill=point_color)
+            # Add label slightly offset from the point
+            draw.text((x + text_offset_x, y + text_offset_y), label, font=font, fill=text_color)
+            sys.stdout.flush()
+        else:
+            print(f"Warning: Skipping drawing point and label for '{label}' due to invalid coordinates: {coords_pixel}")
+            sys.stdout.flush()
     print("DEBUG: Finished drawing loop for labels on ideal diagram.")
     sys.stdout.flush()
-
 
     ideal_diagram_img_path = "ideal_diagram.png"
     try:
@@ -543,7 +719,6 @@ def construct_ideal_diagram(student_refined_points, drawing_instructions, img_sh
         return {}, "ideal_diagram_error_save_failed.png"
     print("--- Step 4 Complete ---")
     sys.stdout.flush()
-    # Return the pixel coordinates of all points in this "completed" ideal diagram
     return ideal_coords_for_comparison, ideal_diagram_img_path
 
 # --- Step 5: Identify and Add Labels (Angles/Lengths) to Student's Diagram (Geometric Analysis) ---
@@ -628,7 +803,7 @@ def identify_and_add_labels_geometric_analysis(refined_points, detected_raw_line
 def visualize_student_detected_points(original_img, student_refined_points, output_path="student_diagram_detected_points.png"):
     """
     Creates an image showing the original student's diagram with detected points
-    overlaid in red. Does NOT draw text labels.
+    overlaid in red. DOES NOT draw text labels.
     """
     print(f"--- Visualizing student's detected points to {output_path} ---")
     sys.stdout.flush()
@@ -681,7 +856,7 @@ def visualize_student_detected_points(original_img, student_refined_points, outp
 def visualize_detected_lines(original_img, detected_lines, output_path):
     """
     Creates an image showing the original student's diagram with detected lines overlaid in blue.
-    Does NOT draw text labels.
+    DOES NOT draw text labels.
     """
     print(f"--- Visualizing detected lines to {output_path} ---")
     sys.stdout.flush()
@@ -713,6 +888,41 @@ def visualize_detected_lines(original_img, detected_lines, output_path):
         sys.stdout.flush()
     print("--- Line Visualization Complete ---")
     sys.stdout.flush()
+
+# --- NEW Helper Function: Visualize Detected Circles ---
+def visualize_detected_circles(original_img, detected_circles, output_path="student_diagram_detected_circles.png"):
+    """
+    Creates an image showing the original student's diagram with detected circles overlaid in green.
+    """
+    print(f"--- Visualizing detected circles to {output_path} ---")
+    sys.stdout.flush()
+    img_pil = Image.fromarray(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    circle_color = (0, 255, 0, 200) # Green, semi-transparent
+    circle_width = 3
+
+    for cx, cy, r in detected_circles:
+        try:
+            # Draw the circle using ellipse method (x0, y0, x1, y1) where (x0,y0) is top-left and (x1,y1) is bottom-right
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=circle_color, width=circle_width)
+            print(f"DEBUG: Drawing detected circle at center ({cx:.0f}, {cy:.0f}) with radius {r:.0f}.")
+        except Exception as e:
+            print(f"ERROR in visualize_detected_circles: Failed to draw circle ({cx}, {cy}, {r}): {e}")
+            sys.stdout.flush()
+            continue
+
+    sys.stdout.flush()
+    try:
+        img_pil.save(output_path)
+        print(f"Detected circles visualization saved to {output_path}")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"ERROR in visualize_detected_circles: Failed to save {output_path}: {e}")
+        sys.stdout.flush()
+    print("--- Circle Visualization Complete ---")
+    sys.stdout.flush()
+
 
 # --- NEW Helper Function: Visualize Overlay Diagram ---
 def visualize_overlay_diagram(original_img_path, ideal_diagram_img_path, output_path="overlay_diagram.png"):
@@ -903,6 +1113,99 @@ def visual_overlay_conceptual(hand_drawn_img_path, ideal_diagram_img_path):
     print("--- Step 7 Complete ---")
     sys.stdout.flush()
 
+# --- New function to generate drawing code snippet ---
+def generate_drawing_code_snippet(ideal_coords, drawing_plan, img_width, img_height):
+    """
+    Generates a Python code snippet (as a string) that uses Pillow to draw the ideal diagram.
+    This acts as the "agent" converting LLM instructions to executable code.
+    """
+    code_lines = []
+    code_lines.append("from PIL import Image, ImageDraw, ImageFont")
+    code_lines.append("import numpy as np")
+    code_lines.append("")
+    code_lines.append(f"img_width = {img_width}")
+    code_lines.append(f"img_height = {img_height}")
+    code_lines.append("ideal_img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))")
+    code_lines.append("draw = ImageDraw.Draw(ideal_img)")
+    code_lines.append("")
+    code_lines.append("line_color_solid = (255, 0, 0, 255)")
+    code_lines.append("point_color = (255, 0, 0, 255)")
+    code_lines.append("text_color = (255, 0, 0, 255)")
+    code_lines.append("line_width = 4")
+    code_lines.append("point_radius = 8")
+    code_lines.append("text_offset_x = 15")
+    code_lines.append("text_offset_y = 15")
+    code_lines.append("")
+    code_lines.append("try:")
+    code_lines.append("    font = ImageFont.truetype('arial.ttf', 40)")
+    code_lines.append("except IOError:")
+    code_lines.append("    font = ImageFont.load_default()")
+    code_lines.append("")
+
+    # Define points
+    code_lines.append("# Define ideal points")
+    for label, coords in ideal_coords.items():
+        if coords is not None and not np.isnan(coords).any():
+            code_lines.append(f"{label}_coords = np.array({coords.tolist()})")
+    code_lines.append("")
+
+    # Draw lines
+    code_lines.append("# Draw line segments")
+    for segment_labels in drawing_plan.get("lines_to_draw", []):
+        if len(segment_labels) == 2:
+            p1_label, p2_label = segment_labels
+            # Ensure points are defined in the snippet's scope
+            code_lines.append(f"if '{p1_label}' in locals() and '{p2_label}' in locals():")
+            code_lines.append(f"    draw.line([tuple({p1_label}_coords), tuple({p2_label}_coords)], fill=line_color_solid, width=line_width)")
+            code_lines.append("else:")
+            code_lines.append(f"    print(f'Warning: Points for line {p1_label}{p2_label} not defined.')")
+    code_lines.append("")
+
+    # Draw circles
+    code_lines.append("# Draw circles")
+    for circle_info in drawing_plan.get("circles_to_draw", []):
+        circle_type = circle_info['type']
+        if circle_type == "circumcircle":
+            points_labels = circle_info.get('points')
+            if points_labels and len(points_labels) == 3:
+                p1_label, p2_label, p3_label = points_labels
+                code_lines.append("# Circumcircle calculation (inlined for snippet self-containment)")
+                code_lines.append("def _get_circumcircle_snippet(p1, p2, p3):")
+                code_lines.append("    p1, p2, p3 = np.array(p1), np.array(p2), np.array(p3)")
+                code_lines.append("    area = 0.5 * abs(p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1]))")
+                code_lines.append("    if area < 1e-6: return None, None, None")
+                code_lines.append("    D = 2 * (p1[0] * (p2[1] - p3[1]) + p2[0] * (p3[1] - p1[1]) + p3[0] * (p1[1] - p2[1]))")
+                code_lines.append("    if D == 0: return None, None, None")
+                code_lines.append("    sq1, sq2, sq3 = np.sum(p1**2), np.sum(p2**2), np.sum(p3**2)")
+                code_lines.append("    cx = (sq1 * (p2[1] - p3[1]) + sq2 * (p3[1] - p1[1]) + sq3 * (p1[1] - p2[1])) / D")
+                code_lines.append("    cy = (sq1 * (p3[0] - p2[0]) + sq2 * (p1[0] - p3[0]) + sq3 * (p2[0] - p1[0])) / D")
+                code_lines.append("    r = np.linalg.norm(p1 - np.array([cx, cy]))")
+                code_lines.append("    return cx, cy, r")
+                code_lines.append("")
+                code_lines.append(f"if '{p1_label}' in locals() and '{p2_label}' in locals() and '{p3_label}' in locals():")
+                code_lines.append(f"    cx, cy, r = _get_circumcircle_snippet({p1_label}_coords, {p2_label}_coords, {p3_label}_coords)")
+                code_lines.append("    if cx is not None:")
+                code_lines.append("        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=line_color_solid, width=line_width)")
+                code_lines.append("else:")
+                code_lines.append(f"    print(f'Warning: Points for circumcircle {points_labels} not defined.')")
+    code_lines.append("")
+
+    # Draw points and labels
+    code_lines.append("# Draw points and labels")
+    for label, coords in ideal_coords.items():
+        if coords is not None and not np.isnan(coords).any():
+            code_lines.append(f"if '{label}' in locals():") # Check if point is defined in the snippet's scope
+            code_lines.append(f"    x, y = {label}_coords")
+            code_lines.append("    draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), fill=point_color)")
+            code_lines.append(f"    draw.text((x + text_offset_x, y + text_offset_y), '{label}', font=font, fill=text_color)")
+            code_lines.append("else:")
+            code_lines.append(f"    print(f'Warning: Point {label} not defined for drawing label.')")
+    code_lines.append("")
+    code_lines.append("ideal_img.save('generated_ideal_diagram_snippet.png')")
+
+    return "\n".join(code_lines)
+
+
 # --- Main Workflow Execution ---
 def main_workflow(image_path, question_text):
     """
@@ -920,20 +1223,26 @@ def main_workflow(image_path, question_text):
     print("DEBUG: After initial_image_processing_ocr.")
     sys.stdout.flush()
 
-    # Step 3 (called early to get anchor points for Step 2)
-    drawing_instructions, num_determining_points, easiest_anchor_points, expected_line_segments = understand_diagram_structure_llm(question_text)
-    print("DEBUG: After understand_diagram_structure_llm (early call).")
+    # Step 3 (initial LLM call): Understand Diagram Structure from Question
+    drawing_instructions, num_determining_points, easiest_anchor_points, expected_line_segments_initial = understand_diagram_structure_llm(question_text)
+    print("DEBUG: After understand_diagram_structure_llm (initial call).")
     sys.stdout.flush()
 
 
     # Step 2: Identify Diagram Vertices/Points & Shapes from Hand-drawn Diagram
     student_refined_points, student_detected_raw_lines, student_detected_circles = \
-        identify_diagram_features(hand_drawn_img, ocr_capital_labels, easiest_anchor_points, expected_line_segments)
+        identify_diagram_features(hand_drawn_img, ocr_capital_labels, easiest_anchor_points, expected_line_segments_initial)
     print("DEBUG: After identify_diagram_features.")
     sys.stdout.flush()
 
+    # NEW Intermediary LLM Agent: Get Detailed Drawing Plan
+    drawing_plan = get_detailed_drawing_plan_llm(question_text, student_refined_points)
+    print("DEBUG: After get_detailed_drawing_plan_llm.")
+    sys.stdout.flush()
+
     # Step 4: Construct the Ideal Diagram Image (Programmatic Drawing)
-    ideal_coords_for_comparison, ideal_diagram_img_path = construct_ideal_diagram(student_refined_points, drawing_instructions, hand_drawn_img.shape)
+    # Now pass the detailed drawing_plan to construct_ideal_diagram
+    ideal_coords_for_comparison, ideal_diagram_img_path = construct_ideal_diagram(student_refined_points, drawing_plan, hand_drawn_img.shape)
     print("DEBUG: After construct_ideal_diagram.")
     sys.stdout.flush()
     if ideal_diagram_img_path == "ideal_diagram_error.png" or ideal_diagram_img_path == "ideal_diagram_error_save_failed.png":
@@ -942,7 +1251,6 @@ def main_workflow(image_path, question_text):
         return
 
     # Step 5: Identify and Add Labels (Angles/Lengths) to Student's Diagram (Geometric Analysis)
-    # Pass student_detected_raw_lines instead of student_detected_lines_processed
     labeled_features = identify_and_add_labels_geometric_analysis(student_refined_points, student_detected_raw_lines, ocr_lowercase_greek_labels)
     print("DEBUG: After identify_and_add_labels_geometric_analysis.")
     sys.stdout.flush()
@@ -954,9 +1262,10 @@ def main_workflow(image_path, question_text):
     print("DEBUG: After judge_student_diagram.")
     sys.stdout.flush()
 
-    # --- NEW: Visualizations for debugging ---
+    # --- Visualizations for debugging ---
     visualize_student_detected_points(hand_drawn_img, student_refined_points)
     visualize_detected_lines(hand_drawn_img, student_detected_raw_lines, output_path="student_diagram_detected_raw_lines.png")
+    visualize_detected_circles(hand_drawn_img, student_detected_circles, output_path="student_diagram_detected_circles.png") # NEW
     
     # Call the new overlay function
     overlay_output_path = visualize_overlay_diagram(image_path, ideal_diagram_img_path)
@@ -966,6 +1275,14 @@ def main_workflow(image_path, question_text):
     # Step 7: Visual Overlay on Website (Conceptual)
     visual_overlay_conceptual(image_path, ideal_diagram_img_path)
     print("DEBUG: After visual_overlay_conceptual.")
+    sys.stdout.flush()
+
+    # Generate and print the drawing code snippet
+    # Now pass the detailed drawing_plan to generate_drawing_code_snippet
+    generated_drawing_code = generate_drawing_code_snippet(ideal_coords_for_comparison, drawing_plan, hand_drawn_img.shape[1], hand_drawn_img.shape[0])
+    print("\n--- Generated Drawing Code Snippet (from LLM instructions) ---")
+    print(generated_drawing_code)
+    print("--- End Generated Drawing Code Snippet ---")
     sys.stdout.flush()
 
     print("\n--- Diagram Processing Workflow Complete ---")
@@ -985,6 +1302,7 @@ def main_workflow(image_path, question_text):
 # --- Execute the workflow ---
 if __name__ == "__main__":
     input_image_path = "image_e14ecd.jpg"
-    math_olympiad_question = "Draw an isosceles triangle where AB = BC then construct ABDC where D is the reflection of B over AC"
+    # Updated question to include circumcircle
+    math_olympiad_question = "Draw an isosceles triangle where AB = BC then construct ADC where D is the reflection of B over AC and its circumcircle."
 
     main_workflow(input_image_path, math_olympiad_question)
